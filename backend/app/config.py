@@ -17,6 +17,13 @@ class Settings:
     max_transaction_minor: int = 50_000_000  # NGN 500,000.00
     fx_alert_threshold_bps: int = 500
     max_fx_conversion_percent: int = 25
+    auth_rate_limit_per_minute: int = int(
+        os.getenv("AUTH_RATE_LIMIT_PER_MINUTE", "10")
+    )
+    financial_rate_limit_per_minute: int = int(
+        os.getenv("FINANCIAL_RATE_LIMIT_PER_MINUTE", "30")
+    )
+    webhook_max_age_seconds: int = int(os.getenv("WEBHOOK_MAX_AGE_SECONDS", "300"))
 
 
 settings = Settings()

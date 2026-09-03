@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -20,11 +21,21 @@ from app.repositories import (
     get_transaction_by_proposal, get_user_by_email, get_user_by_id,
     get_wallet_by_user, get_webhook_event, list_user_pockets, utc_now,
 )
+from app.rate_limit import enforce_rate_limit
 from app.schemas import (
     ActionPlanRequest, CurrencyShieldRequest, LoginRequest, PocketCreateRequest,
     RegisterRequest, SignatureRequest, WalletLinkRequest,
 )
 from app.security import create_access_token, decode_access_token, hash_password, verify_password
+from app.workflow import (
+    ACTION_PLAN_TRANSITIONS,
+    RECOMMENDATION_TRANSITIONS,
+    TRANSACTION_TRANSITIONS,
+    ActionPlanStatus,
+    RecommendationStatus,
+    TransactionStatus,
+    transition,
+)
 
 
 @asynccontextmanager
@@ -71,7 +82,13 @@ def health() -> dict:
 
 
 @app.post("/v1/auth/register", status_code=201)
-def register(payload: RegisterRequest) -> dict:
+def register(payload: RegisterRequest, request: Request) -> dict:
+    enforce_rate_limit(
+        request,
+        scope="auth-register",
+        limit=settings.auth_rate_limit_per_minute,
+        window_seconds=60,
+    )
     email, user_id = str(payload.email).lower(), new_id("usr")
     try:
         with session_scope() as session:
@@ -105,7 +122,13 @@ def register(payload: RegisterRequest) -> dict:
 
 
 @app.post("/v1/auth/login")
-def login(payload: LoginRequest) -> dict:
+def login(payload: LoginRequest, request: Request) -> dict:
+    enforce_rate_limit(
+        request,
+        scope="auth-login",
+        limit=settings.auth_rate_limit_per_minute,
+        window_seconds=60,
+    )
     with session_scope() as session:
         user = get_user_by_email(session, str(payload.email).lower())
         if not user or not verify_password(payload.password, user.password_hash):
@@ -177,8 +200,15 @@ def create_action_plan(payload: ActionPlanRequest, user: User = Depends(current_
 
 @app.post("/v1/action-plans/{plan_id}/approve", status_code=201)
 def approve_action_plan(plan_id: str,
+                        request: Request,
                         idempotency_key: str = Header(min_length=8, max_length=128, alias="Idempotency-Key"),
                         user: User = Depends(current_user)) -> dict:
+    enforce_rate_limit(
+        request,
+        scope=f"financial-approval:{user.id}",
+        limit=settings.financial_rate_limit_per_minute,
+        window_seconds=60,
+    )
     with session_scope() as session:
         existing = get_transaction_by_idempotency(session, user.id, idempotency_key)
         if existing:
@@ -187,19 +217,48 @@ def approve_action_plan(plan_id: str,
                               ActionPlan.user_id == user.id).with_for_update())
         if not plan:
             raise HTTPException(status_code=404, detail="Action plan not found")
-        if plan.approval_status != "AWAITING_USER_APPROVAL":
+        if plan.approval_status != ActionPlanStatus.AWAITING_USER_APPROVAL:
             raise HTTPException(status_code=409, detail="Action plan cannot be approved in its current state")
-        plan.approval_status = "CREATING_PROPOSAL"
+        plan.approval_status = transition(
+            plan.approval_status,
+            ActionPlanStatus.CREATING_PROPOSAL,
+            ACTION_PLAN_TRANSITIONS,
+        )
         snapshot = (plan.amount_minor, plan.currency, plan.recipient_name)
-    proposal = bmoni.create_withdrawal_proposal(bmoni_user_id=user.bmoni_user_id or "",
-                                                amount_minor=snapshot[0], currency=snapshot[1],
-                                                recipient_name=snapshot[2])
+    try:
+        proposal = bmoni.create_withdrawal_proposal(
+            bmoni_user_id=user.bmoni_user_id or "",
+            amount_minor=snapshot[0],
+            currency=snapshot[1],
+            recipient_name=snapshot[2],
+        )
+    except Exception:
+        with session_scope() as session:
+            failed_plan = get_action_plan(session, plan_id, user.id)
+            if failed_plan and failed_plan.approval_status == ActionPlanStatus.CREATING_PROPOSAL:
+                failed_plan.approval_status = transition(
+                    failed_plan.approval_status,
+                    ActionPlanStatus.FAILED,
+                    ACTION_PLAN_TRANSITIONS,
+                )
+                add_audit(
+                    session,
+                    event_id=new_id("aud"),
+                    actor_user_id=user.id,
+                    action="WITHDRAWAL_APPROVE",
+                    resource_type="ACTION_PLAN",
+                    resource_id=plan_id,
+                    outcome="FAILED",
+                )
+        raise
     transaction_id = new_id("txn")
     with session_scope() as session:
         plan = get_action_plan(session, plan_id, user.id)
         if not plan:
             raise HTTPException(status_code=404, detail="Action plan not found")
-        plan.approval_status = "APPROVED"
+        plan.approval_status = transition(
+            plan.approval_status, ActionPlanStatus.APPROVED, ACTION_PLAN_TRANSITIONS
+        )
         session.add(Transaction(id=transaction_id, user_id=user.id, action_plan_id=plan_id,
                                 bmoni_proposal_id=proposal["id"], amount_minor=plan.amount_minor,
                                 currency=plan.currency, status="PENDING_SIGNATURE",
@@ -235,7 +294,14 @@ def signing_payload(transaction_id: str, user: User = Depends(current_user)) -> 
 
 @app.post("/v1/transactions/{transaction_id}/signature")
 def submit_signature(transaction_id: str, payload: SignatureRequest,
+                     request: Request,
                      user: User = Depends(current_user)) -> dict:
+    enforce_rate_limit(
+        request,
+        scope=f"financial-signature:{user.id}",
+        limit=settings.financial_rate_limit_per_minute,
+        window_seconds=60,
+    )
     item = owned_transaction(transaction_id, user.id)
     if item.status != "PENDING_SIGNATURE":
         raise HTTPException(status_code=409, detail="Transaction is not awaiting a signature")
@@ -248,7 +314,10 @@ def submit_signature(transaction_id: str, payload: SignatureRequest,
         stored = get_transaction(session, transaction_id, user.id)
         if not stored:
             raise HTTPException(status_code=404, detail="Transaction not found")
-        stored.status, stored.bmoni_status = local_status, remote["status"]
+        stored.status = transition(
+            stored.status, TransactionStatus(local_status), TRANSACTION_TRANSITIONS
+        )
+        stored.bmoni_status = remote["status"]
         stored.completed_at = utc_now() if local_status == "COMPLETED" else None
         add_audit(session, event_id=new_id("aud"), actor_user_id=user.id,
                   action="SIGNATURE_SUBMIT", resource_type="TRANSACTION",
@@ -257,10 +326,23 @@ def submit_signature(transaction_id: str, payload: SignatureRequest,
 
 
 @app.post("/v1/webhooks/bmoni")
-async def bmoni_webhook(request: Request, x_bmoni_signature: str | None = Header(default=None)) -> dict:
+async def bmoni_webhook(
+    request: Request,
+    x_bmoni_signature: str | None = Header(default=None),
+    x_bmoni_timestamp: str | None = Header(default=None),
+) -> dict:
     raw = await request.body()
     if settings.bmoni_webhook_secret:
-        expected = hmac.new(settings.bmoni_webhook_secret.encode(), raw, hashlib.sha256).hexdigest()
+        try:
+            timestamp = int(x_bmoni_timestamp or "")
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Invalid webhook timestamp")
+        if abs(int(time.time()) - timestamp) > settings.webhook_max_age_seconds:
+            raise HTTPException(status_code=401, detail="Stale webhook")
+        signed_payload = str(timestamp).encode() + b"." + raw
+        expected = hmac.new(
+            settings.bmoni_webhook_secret.encode(), signed_payload, hashlib.sha256
+        ).hexdigest()
         if not x_bmoni_signature or not hmac.compare_digest(x_bmoni_signature, expected):
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
     elif settings.environment != "development":
@@ -278,7 +360,10 @@ async def bmoni_webhook(request: Request, x_bmoni_signature: str | None = Header
         local_status = {"COMPLETED": "COMPLETED", "FAILED": "FAILED",
                         "PENDING": "PROCESSING"}.get(remote_status, "REQUIRES_REVIEW")
         if item and item.status not in {"COMPLETED", "FAILED"}:
-            item.status, item.bmoni_status = local_status, remote_status
+            item.status = transition(
+                item.status, TransactionStatus(local_status), TRANSACTION_TRANSITIONS
+            )
+            item.bmoni_status = remote_status
             item.completed_at = utc_now() if local_status == "COMPLETED" else None
         session.add(WebhookEvent(id=event_id, event_type=event_type, external_id=proposal_id,
                                  payload_json=json.dumps(event, separators=(",", ":"), sort_keys=True),
@@ -347,8 +432,15 @@ def create_currency_shield(payload: CurrencyShieldRequest,
 
 @app.post("/v1/recommendations/{recommendation_id}/approve", status_code=201)
 def approve_currency_shield(recommendation_id: str,
+                            request: Request,
                             idempotency_key: str = Header(min_length=8, max_length=128, alias="Idempotency-Key"),
                             user: User = Depends(current_user)) -> dict:
+    enforce_rate_limit(
+        request,
+        scope=f"financial-fx:{user.id}",
+        limit=settings.financial_rate_limit_per_minute,
+        window_seconds=60,
+    )
     with session_scope() as session:
         existing = get_fx_by_idempotency(session, user.id, idempotency_key)
         if existing:
@@ -357,21 +449,58 @@ def approve_currency_shield(recommendation_id: str,
             Recommendation.id == recommendation_id, Recommendation.user_id == user.id).with_for_update())
         if not recommendation:
             raise HTTPException(status_code=404, detail="Recommendation not found")
-        if recommendation.status != "AWAITING_APPROVAL":
+        if recommendation.status != RecommendationStatus.AWAITING_APPROVAL:
             raise HTTPException(status_code=409, detail="Recommendation cannot be approved")
-        recommendation.status = "EXECUTING"
+        recommendation.status = transition(
+            recommendation.status,
+            RecommendationStatus.EXECUTING,
+            RECOMMENDATION_TRANSITIONS,
+        )
         snapshot = (recommendation.amount_minor, recommendation.source_currency,
                     recommendation.target_currency)
     if snapshot[0] is None or snapshot[1] is None or snapshot[2] is None:
         raise HTTPException(status_code=409, detail="Recommendation is incomplete")
-    quote = bmoni.get_fx_quote(amount_minor=snapshot[0], source=snapshot[1], target=snapshot[2])
-    remote = bmoni.execute_fx_conversion(quote_id=quote["id"], idempotency_key=idempotency_key)
+    try:
+        quote = bmoni.get_fx_quote(
+            amount_minor=snapshot[0], source=snapshot[1], target=snapshot[2]
+        )
+        remote = bmoni.execute_fx_conversion(
+            quote_id=quote["id"], idempotency_key=idempotency_key
+        )
+    except Exception:
+        with session_scope() as session:
+            failed_recommendation = get_recommendation(
+                session, recommendation_id, user.id
+            )
+            if (
+                failed_recommendation
+                and failed_recommendation.status == RecommendationStatus.EXECUTING
+            ):
+                failed_recommendation.status = transition(
+                    failed_recommendation.status,
+                    RecommendationStatus.FAILED,
+                    RECOMMENDATION_TRANSITIONS,
+                )
+                add_audit(
+                    session,
+                    event_id=new_id("aud"),
+                    actor_user_id=user.id,
+                    action="FX_CONVERSION_APPROVE",
+                    resource_type="RECOMMENDATION",
+                    resource_id=recommendation_id,
+                    outcome="FAILED",
+                )
+        raise
     conversion_id = new_id("fx")
     with session_scope() as session:
         recommendation = get_recommendation(session, recommendation_id, user.id)
         if not recommendation:
             raise HTTPException(status_code=404, detail="Recommendation not found")
-        recommendation.status = "EXECUTED"
+        recommendation.status = transition(
+            recommendation.status,
+            RecommendationStatus.EXECUTED,
+            RECOMMENDATION_TRANSITIONS,
+        )
         session.add(FxConversion(id=conversion_id, user_id=user.id,
                                  recommendation_id=recommendation_id,
                                  bmoni_conversion_id=remote["id"], status=remote["status"],
