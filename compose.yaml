@@ -1,6 +1,23 @@
 name: flowpilot
 
 services:
+  postgres:
+    image: postgres:17.10-alpine3.23
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-flowpilot}
+      POSTGRES_USER: ${POSTGRES_USER:-flowpilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-postgres-password}
+    volumes:
+      - flowpilot-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
@@ -11,13 +28,11 @@ services:
     environment:
       FLOWPILOT_ENV: ${FLOWPILOT_ENV:-development}
       FLOWPILOT_SECRET: ${FLOWPILOT_SECRET:-dev-only-change-before-deploy}
-      FLOWPILOT_DB_PATH: /data/flowpilot.db
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-flowpilot}:${POSTGRES_PASSWORD:-local-postgres-password}@postgres:5432/${POSTGRES_DB:-flowpilot}
       BMONI_MODE: ${BMONI_MODE:-mock}
       BMONI_BASE_URL: ${BMONI_BASE_URL:-}
       BMONI_API_KEY: ${BMONI_API_KEY:-}
       BMONI_WEBHOOK_SECRET: ${BMONI_WEBHOOK_SECRET:-}
-    volumes:
-      - flowpilot-data:/data
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -28,6 +43,9 @@ services:
     pids_limit: 128
     init: true
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test:
         - CMD
@@ -40,5 +58,4 @@ services:
       retries: 3
 
 volumes:
-  flowpilot-data:
-
+  flowpilot-postgres:

@@ -34,6 +34,14 @@ uvicorn app.main:app --reload
 
 Open `http://127.0.0.1:8000/docs` for the interactive API.
 
+Database migrations are managed with Alembic:
+
+```powershell
+alembic upgrade head
+```
+
+All runtime persistence uses SQLAlchemy. Local Python runs default to SQLite; Docker Compose uses PostgreSQL and applies Alembic migrations before starting the API.
+
 ## Docker (recommended)
 
 From the repository root:
@@ -49,7 +57,7 @@ Stop the service without deleting the database volume:
 docker compose down
 ```
 
-The container runs as UID/GID `10001`, drops Linux capabilities, uses a read-only root filesystem, and writes SQLite data only to the named `/data` volume. Do not use the development secret in a shared or deployed environment.
+The backend container runs as UID/GID `10001`, drops Linux capabilities, and uses a read-only root filesystem. PostgreSQL owns the persistent named volume. Do not use either development password in a shared or deployed environment.
 
 ## Demo flow
 
