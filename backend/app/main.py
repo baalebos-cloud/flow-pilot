@@ -10,7 +10,7 @@ from jwt import InvalidTokenError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.bmoni import BmoniConfigurationError, bmoni
+from app.bmoni import BmoniError, bmoni
 from app.config import settings
 from app.database import session_scope
 from app.models import ActionPlan, FxConversion, Pocket, Recommendation, Transaction, User, Wallet, WebhookEvent
@@ -23,7 +23,8 @@ from app.repositories import (
 from app.rate_limit import enforce_rate_limit
 from app.schemas import (
     ActionPlanRequest, CurrencyShieldRequest, LoginRequest, PocketCreateRequest,
-    RegisterRequest, SignatureRequest, WalletLinkRequest,
+    ManagedWalletCreateRequest, OwnerProofChallengeRequest, RegisterRequest,
+    SignatureRequest, WalletLinkRequest,
 )
 from app.security import create_access_token, decode_access_token, hash_password, verify_password
 from app.workflow import (
@@ -69,10 +70,18 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
         return user
 
 
-@app.exception_handler(BmoniConfigurationError)
-async def bmoni_config_error(_: Request, exc: BmoniConfigurationError):
+@app.exception_handler(BmoniError)
+async def bmoni_error(_: Request, exc: BmoniError):
     from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": str(exc),
+            "code": exc.code,
+            "retryable": exc.retryable,
+        },
+    )
 
 
 @app.get("/health")
@@ -93,13 +102,20 @@ def register(payload: RegisterRequest, request: Request) -> dict:
         with session_scope() as session:
             if get_user_by_email(session, email):
                 raise HTTPException(status_code=409, detail="A FlowPilot account with this email already exists")
-            session.add(User(id=user_id, email=email, name=payload.name,
+            session.add(User(id=user_id, email=email,
+                             name=f"{payload.first_name} {payload.last_name}",
                              password_hash=hash_password(payload.password),
                              provisioning_status="PENDING", created_at=utc_now()))
     except IntegrityError:
         raise HTTPException(status_code=409, detail="A FlowPilot account with this email already exists")
     try:
-        remote = bmoni.create_user(external_id=user_id, email=email, name=payload.name)
+        remote = bmoni.create_user(
+            external_id=user_id,
+            email=email,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            phone_number=payload.phone_number,
+        )
     except Exception:
         with session_scope() as session:
             user = get_user_by_id(session, user_id)
@@ -168,6 +184,101 @@ def link_wallet(payload: WalletLinkRequest, user: User = Depends(current_user)) 
         raise HTTPException(status_code=409, detail="This user or wallet address is already linked")
     return {"id": wallet_id, "bmoni_wallet_id": remote["id"],
             "status": remote["status"], "currency": currency}
+
+
+@app.post("/v1/wallets/owner-proof-challenges", status_code=201)
+def create_owner_proof_challenge(
+    payload: OwnerProofChallengeRequest, user: User = Depends(current_user)
+) -> dict:
+    currency = payload.currency.upper()
+    if currency != "CNGN":
+        raise HTTPException(status_code=422, detail="The MVP currently supports CNGN only")
+    if not user.bmoni_user_id:
+        raise HTTPException(status_code=409, detail="BMONI user provisioning is incomplete")
+    challenge = bmoni.create_owner_proof_challenge(
+        bmoni_user_id=user.bmoni_user_id,
+        owner_address=payload.owner_address,
+        currency=currency,
+    )
+    required = {"challengeId", "groupId", "message", "expiresAt"}
+    if not isinstance(challenge, dict) or not required.issubset(challenge):
+        raise BmoniError(
+            "BMONI owner-proof response is invalid", code="BMONI_INVALID_RESPONSE"
+        )
+    return {key: challenge[key] for key in required}
+
+
+@app.post("/v1/wallets/managed", status_code=201)
+def create_managed_wallet(
+    payload: ManagedWalletCreateRequest, user: User = Depends(current_user)
+) -> dict:
+    currency = payload.currency.upper()
+    if currency != "CNGN":
+        raise HTTPException(status_code=422, detail="The MVP currently supports CNGN only")
+    if not user.bmoni_user_id:
+        raise HTTPException(status_code=409, detail="BMONI user provisioning is incomplete")
+    with session_scope() as session:
+        existing = get_wallet_by_user(session, user.id)
+        if existing:
+            return model_dict(existing)
+    remote = bmoni.create_managed_wallet(
+        bmoni_user_id=user.bmoni_user_id,
+        owner_address=payload.owner_address,
+        currency=currency,
+        challenge_id=payload.challenge_id,
+        signature=payload.signature,
+    )
+    try:
+        remote_id = str(remote["id"])
+        wallet_address = str(remote["walletAddress"])
+        active = bool(remote["isActive"])
+    except (KeyError, TypeError) as exc:
+        raise BmoniError(
+            "BMONI managed-wallet response is invalid", code="BMONI_INVALID_RESPONSE"
+        ) from exc
+    if not wallet_address.startswith("0x"):
+        raise BmoniError(
+            "BMONI managed wallet has no deployed address",
+            code="BMONI_WALLET_NOT_DEPLOYED",
+            retryable=True,
+        )
+    wallet_id = new_id("wal")
+    status = "ACTIVE" if active else "PENDING"
+    try:
+        with session_scope() as session:
+            session.add(
+                Wallet(
+                    id=wallet_id,
+                    user_id=user.id,
+                    bmoni_wallet_id=remote_id,
+                    wallet_address=wallet_address,
+                    currency=currency,
+                    status=status,
+                    created_at=utc_now(),
+                )
+            )
+            add_audit(
+                session,
+                event_id=new_id("aud"),
+                actor_user_id=user.id,
+                action="MANAGED_WALLET_CREATE",
+                resource_type="WALLET",
+                resource_id=wallet_id,
+                outcome="SUCCEEDED",
+            )
+    except IntegrityError:
+        with session_scope() as session:
+            existing = get_wallet_by_user(session, user.id)
+            if existing:
+                return model_dict(existing)
+        raise
+    return {
+        "id": wallet_id,
+        "bmoni_wallet_id": remote_id,
+        "wallet_address": wallet_address,
+        "currency": currency,
+        "status": status,
+    }
 
 
 @app.post("/v1/action-plans", status_code=201)
