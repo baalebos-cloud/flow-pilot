@@ -23,7 +23,6 @@ class Settings:
     financial_rate_limit_per_minute: int = int(
         os.getenv("FINANCIAL_RATE_LIMIT_PER_MINUTE", "30")
     )
-    webhook_max_age_seconds: int = int(os.getenv("WEBHOOK_MAX_AGE_SECONDS", "300"))
 
 
 settings = Settings()
