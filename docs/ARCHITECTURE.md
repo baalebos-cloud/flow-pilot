@@ -18,6 +18,8 @@ Flutter app ── FlowPilot JWT ──> FastAPI
 4. State changes require authenticated ownership checks and idempotency.
 5. The Flutter signing SDK owns private-key operations.
 
+The in-process AI boundary is defined by `backend/app/ai/contracts.py` and documented in `docs/AI_CONTRACT.md`. The AI implementation imports this contract directly; it does not receive a BMONI client or database connection.
+
 ## Currency Shield state flow
 
 ```text
