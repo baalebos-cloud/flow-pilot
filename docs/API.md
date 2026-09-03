@@ -1,5 +1,7 @@
 # API contract (scaffold)
 
+The internal backend-to-AI API is documented separately in `docs/AI_CONTRACT.md`.
+
 Interactive documentation is available at `/docs` while the service runs.
 
 ## Implemented endpoints
@@ -27,4 +29,3 @@ Interactive documentation is available at `/docs` while the service runs.
 - Vendor payloads do not leak through the public API.
 - Error responses use stable codes before frontend integration begins.
 - `BMONI_MODE=mock` responses are synthetic and must be labelled in the demo UI.
-

@@ -16,6 +16,7 @@ flow-pilot/
 - [Product requirements](docs/PRD.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [API contract](docs/API.md)
+- [Backend ↔ AI contract](docs/AI_CONTRACT.md)
 - [Security baseline](docs/SECURITY.md)
 - [Tonight's runbook](docs/TONIGHT_RUNBOOK.md)
 - [Presentation pitch](docs/PRESENTATION_PITCH.md)
