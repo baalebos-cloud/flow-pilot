@@ -1,0 +1,3 @@
+import 'package:flutter/material.dart';
+import '../../app/theme/app_colors.dart';
+class DetailRow extends StatelessWidget { final String label; final String value; final bool strong; const DetailRow({super.key,required this.label,required this.value,this.strong=false}); @override Widget build(BuildContext context)=>Padding(padding:const EdgeInsets.symmetric(vertical:8),child:Row(crossAxisAlignment:CrossAxisAlignment.start,children:[Expanded(child:Text(label,style:const TextStyle(fontSize:13,color:AppColors.secondaryText))),const SizedBox(width:12),Flexible(child:Text(value,textAlign:TextAlign.right,style:TextStyle(fontSize:14,fontWeight:strong?FontWeight.w600:FontWeight.w500,color:AppColors.primaryText))) ])); }
