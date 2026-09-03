@@ -16,7 +16,8 @@
 - Integer money representation.
 - Idempotency constraints for money-moving operations.
 - Constant-time HMAC webhook comparison and replay-event storage.
-- Timestamp-bound webhook signatures with a configurable maximum request age.
+- BMONI-compatible raw-body HMAC verification using `X-Webhook-Signature`.
+- Webhook ID header/body consistency checks and database-backed event deduplication.
 - Explicit allowlisted state transitions for approvals, transactions, and recommendations.
 - Application-layer throttling for authentication and money-moving endpoints.
 - Environment-only secrets and committed `.env.example`.
@@ -35,7 +36,6 @@
 - Store BMONI secrets in a cloud secret manager with rotation.
 - Encrypt sensitive PII fields and define retention/deletion policies.
 - Verify wallet ownership using a server nonce and recovered signature.
-- Use BMONI's confirmed webhook scheme; the current HMAC shape is a placeholder.
 - Add immutable audit logs, monitoring, alerts, backups, and incident runbooks.
 - Commission threat modelling, penetration testing, and regulatory/legal review.
 

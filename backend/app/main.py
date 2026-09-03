@@ -1,7 +1,6 @@
 import hashlib
 import hmac
 import json
-import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -328,35 +327,44 @@ def submit_signature(transaction_id: str, payload: SignatureRequest,
 @app.post("/v1/webhooks/bmoni")
 async def bmoni_webhook(
     request: Request,
-    x_bmoni_signature: str | None = Header(default=None),
-    x_bmoni_timestamp: str | None = Header(default=None),
+    x_webhook_signature: str | None = Header(default=None),
+    x_webhook_id: str | None = Header(default=None),
+    x_source_event_id: str | None = Header(default=None),
 ) -> dict:
     raw = await request.body()
     if settings.bmoni_webhook_secret:
-        try:
-            timestamp = int(x_bmoni_timestamp or "")
-        except ValueError:
-            raise HTTPException(status_code=401, detail="Invalid webhook timestamp")
-        if abs(int(time.time()) - timestamp) > settings.webhook_max_age_seconds:
-            raise HTTPException(status_code=401, detail="Stale webhook")
-        signed_payload = str(timestamp).encode() + b"." + raw
         expected = hmac.new(
-            settings.bmoni_webhook_secret.encode(), signed_payload, hashlib.sha256
+            settings.bmoni_webhook_secret.encode(), raw, hashlib.sha256
         ).hexdigest()
-        if not x_bmoni_signature or not hmac.compare_digest(x_bmoni_signature, expected):
+        if not x_webhook_signature or not hmac.compare_digest(
+            x_webhook_signature, expected
+        ):
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
     elif settings.environment != "development":
         raise HTTPException(status_code=503, detail="Webhook secret is not configured")
     try:
         event = json.loads(raw)
-        event_id, event_type = str(event["id"]), str(event["type"])
-        proposal_id, remote_status = str(event["proposal_id"]), str(event["status"])
+        event_id, event_type = str(event["id"]), str(event["eventType"])
+        payload = event["payload"]
+        if not isinstance(payload, dict):
+            raise TypeError
     except (ValueError, KeyError, TypeError):
         raise HTTPException(status_code=422, detail="Invalid webhook payload")
+    if not x_webhook_id or not hmac.compare_digest(x_webhook_id, event_id):
+        raise HTTPException(status_code=422, detail="Webhook ID header does not match body")
+
+    proposal_id = str(
+        payload.get("proposalId")
+        or payload.get("proposal_id")
+        or payload.get("withdrawalId")
+        or ""
+    )
+    event_status = event_type.rsplit(".", maxsplit=1)[-1].upper()
+    remote_status = str(payload.get("status") or event_status).upper()
     with session_scope() as session:
         if get_webhook_event(session, event_id):
             return {"received": True, "duplicate": True}
-        item = get_transaction_by_proposal(session, proposal_id)
+        item = get_transaction_by_proposal(session, proposal_id) if proposal_id else None
         local_status = {"COMPLETED": "COMPLETED", "FAILED": "FAILED",
                         "PENDING": "PROCESSING"}.get(remote_status, "REQUIRES_REVIEW")
         if item and item.status not in {"COMPLETED", "FAILED"}:
@@ -365,7 +373,8 @@ async def bmoni_webhook(
             )
             item.bmoni_status = remote_status
             item.completed_at = utc_now() if local_status == "COMPLETED" else None
-        session.add(WebhookEvent(id=event_id, event_type=event_type, external_id=proposal_id,
+        external_id = x_source_event_id or proposal_id or event_id
+        session.add(WebhookEvent(id=event_id, event_type=event_type, external_id=external_id,
                                  payload_json=json.dumps(event, separators=(",", ":"), sort_keys=True),
                                  processed=True, created_at=utc_now()))
     return {"received": True, "duplicate": False}
