@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.test-tmp*/
+pytest-cache-files-*/
+*.pyc
+flowpilot.db
+.docx_review/

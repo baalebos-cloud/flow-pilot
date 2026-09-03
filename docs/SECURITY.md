@@ -1,0 +1,46 @@
+# Security and trust baseline
+
+## Non-negotiable invariants
+
+- The backend and AI never receive wallet PINs or private keys.
+- The LLM cannot call financial APIs.
+- No money moves without explicit, recorded user approval.
+- Protected pockets are excluded from recommendations.
+- BMONI remains the authority for balances and settlement.
+
+## Controls in this scaffold
+
+- Argon2id password hashing via `argon2-cffi`.
+- Short-lived signed access tokens.
+- Pydantic request validation and ownership-scoped database queries.
+- Integer money representation.
+- Idempotency constraints for money-moving operations.
+- Constant-time HMAC webhook comparison and replay-event storage.
+- Environment-only secrets and committed `.env.example`.
+- Pinned production/development dependencies.
+- `bandit`, `pip-audit`, and `ruff` security/quality gates.
+- BMONI live mode fails closed until confirmed schemas are implemented.
+
+## Required before production
+
+- Use a managed identity provider with MFA/OTP and refresh-token rotation.
+- Replace SQLite with encrypted managed PostgreSQL and migrations.
+- Add API-gateway rate limits, WAF, TLS, CORS allowlist, and secure headers.
+- Store BMONI secrets in a cloud secret manager with rotation.
+- Encrypt sensitive PII fields and define retention/deletion policies.
+- Verify wallet ownership using a server nonce and recovered signature.
+- Use BMONI's confirmed webhook scheme; the current HMAC shape is a placeholder.
+- Add immutable audit logs, monitoring, alerts, backups, and incident runbooks.
+- Commission threat modelling, penetration testing, and regulatory/legal review.
+
+## CI commands
+
+```powershell
+cd backend
+ruff check app tests
+bandit -r app
+pip-audit -r requirements.txt
+pytest -q
+```
+
+Passing these checks reduces common risks; it does not constitute a security certification.
