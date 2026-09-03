@@ -3,10 +3,16 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app import config
+from app.database import get_engine, reset_engine_for_tests
+from app.models import Base
 
 
 def test_complete_demo_flow(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(config.settings, "db_path", str(tmp_path / "test.db"))
+    monkeypatch.setattr(
+        config.settings, "database_url", f"sqlite+pysqlite:///{tmp_path / 'test.db'}"
+    )
+    reset_engine_for_tests()
+    Base.metadata.create_all(get_engine())
     from app.main import app
 
     with TestClient(app) as client:
@@ -85,3 +91,6 @@ def test_complete_demo_flow(tmp_path: Path, monkeypatch):
         )
         assert conversion.status_code == 201
         assert conversion.json()["status"] == "COMPLETED"
+
+    get_engine().dispose()
+    reset_engine_for_tests()

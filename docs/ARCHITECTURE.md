@@ -38,6 +38,10 @@ The current mock combines quote and execution for speed. Live integration must p
 - BMONI: embedded financial identity, wallets, KYC, balances, quotes, conversions, transfers, authoritative settlement status.
 - Device: private key and signing PIN.
 
+## Persistence migration
+
+SQLAlchemy 2 models and Alembic migrations define the schema, while repositories isolate route code from persistence. Local tests may use SQLite through the same ORM; Docker Compose runs PostgreSQL and applies migrations before API startup.
+
 ## Failure rules
 
 - Never infer success from HTTP 200 alone; reconcile authoritative status.

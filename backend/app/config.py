@@ -6,7 +6,9 @@ import os
 class Settings:
     environment: str = os.getenv("FLOWPILOT_ENV", "development")
     secret: str = os.getenv("FLOWPILOT_SECRET", "dev-only-change-me")
-    db_path: str = os.getenv("FLOWPILOT_DB_PATH", "flowpilot.db")
+    database_url: str = os.getenv(
+        "DATABASE_URL", "sqlite+pysqlite:///flowpilot.db"
+    )
     bmoni_mode: str = os.getenv("BMONI_MODE", "mock")
     bmoni_base_url: str = os.getenv("BMONI_BASE_URL", "")
     bmoni_api_key: str = os.getenv("BMONI_API_KEY", "")
