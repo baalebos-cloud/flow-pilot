@@ -34,6 +34,23 @@ uvicorn app.main:app --reload
 
 Open `http://127.0.0.1:8000/docs` for the interactive API.
 
+## Docker (recommended)
+
+From the repository root:
+
+```powershell
+$env:FLOWPILOT_SECRET = "replace-with-a-long-random-secret"
+docker compose up --build
+```
+
+Stop the service without deleting the database volume:
+
+```powershell
+docker compose down
+```
+
+The container runs as UID/GID `10001`, drops Linux capabilities, uses a read-only root filesystem, and writes SQLite data only to the named `/data` volume. Do not use the development secret in a shared or deployed environment.
+
 ## Demo flow
 
 1. `POST /v1/auth/register`

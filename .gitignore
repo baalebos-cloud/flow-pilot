@@ -6,4 +6,5 @@ __pycache__/
 pytest-cache-files-*/
 *.pyc
 flowpilot.db
+.env
 .docx_review/

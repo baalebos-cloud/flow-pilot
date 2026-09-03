@@ -20,6 +20,9 @@
 - Pinned production/development dependencies.
 - `bandit`, `pip-audit`, and `ruff` security/quality gates.
 - BMONI live mode fails closed until confirmed schemas are implemented.
+- Container runs as a fixed non-root UID with dropped capabilities and `no-new-privileges`.
+- Container root filesystem is read-only; only the explicit database volume and limited `/tmp` are writable.
+- The runtime image installs production dependencies only.
 
 ## Required before production
 
@@ -44,3 +47,15 @@ pytest -q
 ```
 
 Passing these checks reduces common risks; it does not constitute a security certification.
+
+## Container checks
+
+```powershell
+docker compose config
+docker compose build --pull
+docker compose up -d
+docker compose ps
+docker compose exec backend id
+```
+
+Expected runtime identity is UID/GID `10001`. Add a container-image vulnerability scan in CI before deployment; image scanning complements, but does not replace, the Python dependency audit.

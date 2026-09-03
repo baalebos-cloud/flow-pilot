@@ -44,3 +44,6 @@ The current mock combines quote and execution for speed. Live integration must p
 - Out-of-order webhooks cannot move a final transaction backward.
 - A stale quote must be replaced and shown again before execution.
 
+## Container boundary
+
+The backend is built from `backend/Dockerfile` and orchestrated by root `compose.yaml`. It runs as a non-root user with all Linux capabilities dropped, `no-new-privileges`, a read-only root filesystem, a size-limited temporary filesystem, and a dedicated persistent `/data` volume. Flutter remains outside Docker.

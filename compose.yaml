@@ -1,0 +1,44 @@
+name: flowpilot
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: flowpilot-backend:local
+    ports:
+      - "127.0.0.1:${FLOWPILOT_PORT:-8000}:8000"
+    environment:
+      FLOWPILOT_ENV: ${FLOWPILOT_ENV:-development}
+      FLOWPILOT_SECRET: ${FLOWPILOT_SECRET:-dev-only-change-before-deploy}
+      FLOWPILOT_DB_PATH: /data/flowpilot.db
+      BMONI_MODE: ${BMONI_MODE:-mock}
+      BMONI_BASE_URL: ${BMONI_BASE_URL:-}
+      BMONI_API_KEY: ${BMONI_API_KEY:-}
+      BMONI_WEBHOOK_SECRET: ${BMONI_WEBHOOK_SECRET:-}
+    volumes:
+      - flowpilot-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  flowpilot-data:
+

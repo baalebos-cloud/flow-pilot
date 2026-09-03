@@ -11,6 +11,7 @@
 - Replace mock FX quote/execution methods in `backend/app/bmoni.py` using confirmed BMONI contracts.
 - Implement state machine, idempotency, reconciliation, error mapping, audit events, and rate limiting.
 - Add integration/contract/security tests and CI gates.
+- Maintain the hardened backend Docker image, Compose service, health checks, and image scanning.
 - Document all vendor discoveries and update API examples.
 
 ## Acceptance criteria

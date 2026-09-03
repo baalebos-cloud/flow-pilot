@@ -22,8 +22,17 @@ flow-pilot/
 - [Backend setup](backend/README.md)
 - [Frontend workspace](frontend/README.md)
 
+## Run the backend with Docker
+
+```powershell
+$env:FLOWPILOT_SECRET = "replace-with-a-long-random-secret"
+docker compose up --build
+```
+
+The API is available at `http://127.0.0.1:8000` and Swagger at `http://127.0.0.1:8000/docs`.
+The checked-in Compose default secret is for local development only; explicitly set a secret for every shared environment.
+
 ## Work allocation
 
 - Favour owns the heavy platform/security/BMONI integration work in [GitHub issue #1](https://github.com/baalebos-cloud/flow-pilot/issues/1).
 - The second backend developer owns pockets, insights, fixtures, and frontend-facing contracts in [GitHub issue #2](https://github.com/baalebos-cloud/flow-pilot/issues/2).
-

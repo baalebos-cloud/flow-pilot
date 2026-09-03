@@ -14,6 +14,7 @@
 
 1. Agree on fixture: CNGN 300,000 balance; pockets; CNGN 40,000 shield suggestion; USD target.
 2. From `backend/`, run backend tests and launch Swagger in mock mode.
+   Alternatively, set `FLOWPILOT_SECRET` and run `docker compose up --build` from the repository root.
 3. Frontend builds against the published API examples.
 4. Obtain and document BMONI sandbox contract.
 5. Replace mock adapter methods one at a time and add contract tests.
