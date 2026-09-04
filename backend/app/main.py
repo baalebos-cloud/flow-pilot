@@ -10,6 +10,7 @@ from jwt import InvalidTokenError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.ai.router import build_ai_router
 from app.bmoni import BmoniError, bmoni
 from app.balances import available_balance_minor, fetch_wallet_balances, minor_to_decimal
 from app.config import settings
@@ -74,6 +75,9 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
             raise HTTPException(status_code=401, detail="User is unavailable")
         session.expunge(user)
         return user
+
+
+app.include_router(build_ai_router(current_user))
 
 
 @app.exception_handler(BmoniError)
