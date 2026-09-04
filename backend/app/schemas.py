@@ -52,7 +52,7 @@ class ActionPlanRequest(BaseModel):
 
 
 class SignatureRequest(BaseModel):
-    signature: str = Field(min_length=10, max_length=1024)
+    signature: str = Field(pattern=r"^0x[a-fA-F0-9]{130}$")
 
 
 class PocketCreateRequest(BaseModel):
