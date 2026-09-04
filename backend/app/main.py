@@ -125,6 +125,12 @@ app = FastAPI(
 )
 
 
+@app.get("/health", tags=["system"])
+def health() -> dict[str, str]:
+    """Report that the API process is available."""
+    return {"status": "ok"}
+
+
 security = HTTPBearer()
 
 

@@ -1,5 +1,7 @@
 from collections import Counter
 
+from fastapi.testclient import TestClient
+
 from app.main import app
 
 
@@ -25,3 +27,11 @@ def test_transaction_signing_payload_route_is_registered_once():
     ]
 
     assert len(matches) == 1
+
+
+def test_health_endpoint_is_public_and_reports_api_availability():
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
