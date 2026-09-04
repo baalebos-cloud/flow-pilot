@@ -17,6 +17,10 @@ class WalletLinkRequest(BaseModel):
     currency: str = "CNGN"
 
 
+class AIRecommendationRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=1000)
+
+
 class ActionPlanRequest(BaseModel):
     message: str = Field(min_length=5, max_length=1000)
     amount_minor: int = Field(gt=0)
