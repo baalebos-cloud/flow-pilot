@@ -179,6 +179,11 @@ async def handle_bmoni_error(request: Request, exc: BmoniError):
     )
 
 
+@app.get("/health", status_code=200)
+def health_check() -> dict:
+    """Health check endpoint for platform monitoring."""
+    return {"status":"ok","bmoni_mode":"mock"}
+    
 @app.post("/v1/auth/register", status_code=201)
 def register(
     payload: RegisterRequest,
