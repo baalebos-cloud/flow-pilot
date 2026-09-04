@@ -29,6 +29,15 @@ class ResilientLLMAdapter(LLMAdapter):
             if not self._is_provider_failure(exc):
                 raise
 
+            print(
+                "MEMBER3 PRIMARY PROVIDER UNAVAILABLE: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            print(
+                "MEMBER3 FALLBACK: switching to secondary provider."
+            )
+
             return self.fallback.generate_recommendation(request)
 
     @staticmethod
