@@ -213,8 +213,8 @@ def test_sandbox_quote_uses_exact_input_decimal_contract(monkeypatch):
                 "exchangeRate": "0.00062",
                 "toUsdExchangeRate": "0.00062",
                 "fees": [],
-                "quotedAt": "2026-09-04T00:00:00.000Z",
-                "expiresAt": "2026-09-04T00:00:20.000Z",
+                "quotedAt": "2099-09-04T00:00:00.000Z",
+                "expiresAt": "2099-09-04T00:00:20.000Z",
                 "expiresInSeconds": 20,
             },
         )
@@ -234,6 +234,100 @@ def test_sandbox_quote_uses_exact_input_decimal_contract(monkeypatch):
         "fromCurrency": "NGN",
         "toCurrency": "USD",
     }
+
+
+def test_sandbox_balance_response_is_normalized_from_live_shape(monkeypatch):
+    monkeypatch.setattr(config.settings, "bmoni_base_url", "https://embedded-dev.bmoni.com")
+    monkeypatch.setattr(config.settings, "bmoni_api_key", "test-key")
+    live_response = {
+        "smartAccountAddress": "0x1111111111111111111111111111111111111111",
+        "balances": [
+            {
+                "smartWalletId": "wallet-1",
+                "currency": "NGN",
+                "balance": "250000.50",
+                "error": None,
+            }
+        ],
+    }
+
+    monkeypatch.setattr(
+        httpx,
+        "request",
+        lambda *args, **kwargs: response(200, live_response),
+    )
+
+    result = BmoniGateway(mode="sandbox").get_wallet_balances(
+        bmoni_user_id="user-1"
+    )
+
+    assert result == {"data": live_response}
+
+
+@pytest.mark.parametrize("body", [{}, {"balances": None}, []])
+def test_sandbox_balance_response_rejects_invalid_shape(monkeypatch, body):
+    monkeypatch.setattr(config.settings, "bmoni_base_url", "https://embedded-dev.bmoni.com")
+    monkeypatch.setattr(config.settings, "bmoni_api_key", "test-key")
+    monkeypatch.setattr(
+        httpx,
+        "request",
+        lambda *args, **kwargs: response(200, body),
+    )
+
+    with pytest.raises(BmoniError) as exc_info:
+        BmoniGateway(mode="sandbox").get_wallet_balances(
+            bmoni_user_id="user-1"
+        )
+
+    assert exc_info.value.code == "BMONI_INVALID_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    ("override", "expected_code"),
+    [
+        ({"amountIn": "999.99"}, "BMONI_INVALID_QUOTE"),
+        ({"fromCurrency": "USD"}, "BMONI_INVALID_QUOTE"),
+        ({"expiresAt": "2020-01-01T00:00:20.000Z"}, "BMONI_INVALID_QUOTE"),
+        ({"amountOut": "NaN"}, "BMONI_INVALID_QUOTE"),
+    ],
+)
+def test_sandbox_quote_fails_closed_for_invalid_vendor_data(
+    monkeypatch,
+    override,
+    expected_code,
+):
+    monkeypatch.setattr(config.settings, "bmoni_base_url", "https://embedded-dev.bmoni.com")
+    monkeypatch.setattr(config.settings, "bmoni_api_key", "test-key")
+    quote = {
+        "quoteId": "quote-1",
+        "fromCurrency": "NGN",
+        "toCurrency": "USD",
+        "amountIn": "1000.00",
+        "amountOut": "0.62",
+        "exchangeRate": "0.00062",
+        "toUsdExchangeRate": "0.00062",
+        "fees": [],
+        "quotedAt": "2099-09-04T00:00:00.000Z",
+        "expiresAt": "2099-09-04T00:00:20.000Z",
+        "expiresInSeconds": 20,
+    }
+    quote.update(override)
+
+    monkeypatch.setattr(
+        httpx,
+        "request",
+        lambda *args, **kwargs: response(200, quote),
+    )
+
+    with pytest.raises(BmoniError) as exc_info:
+        BmoniGateway(mode="sandbox").get_fx_quote(
+            bmoni_user_id="user-1",
+            amount_decimal="1000.00",
+            source="NGN",
+            target="USD",
+        )
+
+    assert exc_info.value.code == expected_code
 
 
 def test_proposal_approval_uses_verified_sandbox_route(monkeypatch):

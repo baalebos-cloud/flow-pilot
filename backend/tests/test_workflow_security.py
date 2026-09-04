@@ -6,6 +6,8 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from app.bmoni import BmoniError
+from app.main import handle_bmoni_error
 from app.rate_limit import SlidingWindowRateLimiter
 from app.workflow import (
     ACTION_PLAN_TRANSITIONS,
@@ -13,6 +15,35 @@ from app.workflow import (
     InvalidStateTransition,
     transition,
 )
+
+
+@pytest.mark.asyncio
+async def test_bmoni_error_handler_preserves_safe_status_mapping():
+    response = await handle_bmoni_error(
+        None,
+        BmoniError(
+            "Invalid sandbox request",
+            code="BMONI_HTTP_400",
+            status_code=422,
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_bmoni_error_handler_maps_retryable_failures_to_unavailable():
+    response = await handle_bmoni_error(
+        None,
+        BmoniError(
+            "Vendor throttled the request",
+            code="BMONI_HTTP_429",
+            status_code=502,
+            retryable=True,
+        ),
+    )
+
+    assert response.status_code == 503
 
 
 def test_state_machine_allows_only_declared_transitions():
