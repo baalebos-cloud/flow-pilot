@@ -31,6 +31,17 @@ def test_complete_demo_flow(tmp_path: Path, monkeypatch):
         assert body["user"]["bmoni_user_id"].startswith("bm_usr_")
         headers = {"Authorization": f"Bearer {body['access_token']}"}
 
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        ai_response = client.post(
+            "/v1/ai/recommend",
+            headers=headers,
+            json={"message": "Create a food pocket for me"},
+        )
+        assert ai_response.status_code == 200
+        assert ai_response.json()["outcome"] == "MODEL_ERROR"
+        assert ai_response.json()["error_code"] == "PROVIDER_UNAVAILABLE"
+
         wallet = client.post(
             "/v1/wallets/link",
             headers=headers,

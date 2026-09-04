@@ -1,4 +1,5 @@
 ﻿import json
+import asyncio
 import re
 from typing import Any
 
@@ -40,7 +41,9 @@ class Member3Engine:
         request: RecommendationRequest,
     ) -> RecommendationOutcome:
         try:
-            raw_output = self.adapter.generate_recommendation(request)
+            raw_output = await asyncio.to_thread(
+                self.adapter.generate_recommendation, request
+            )
 
             data = self._parse_json(raw_output)
 
@@ -243,14 +246,8 @@ class Member3Engine:
             100000 naira
             NGN 100000
 
-        The MVP convention is that the extracted number is already
-        the backend amount value.
-
-        Therefore:
-
-            100000 naira -> 100000
-
-        We intentionally do NOT multiply by 100.
+        User-entered naira values are major units. The backend contract uses
+        minor units, so 100000 naira becomes 10000000 kobo.
         """
 
         pattern = re.compile(
@@ -294,7 +291,7 @@ class Member3Engine:
         if len(unique_values) != 1:
             return None
 
-        return values[0]
+        return values[0] * 100
 
     @classmethod
     def _normalize_explicit_amount(
@@ -303,11 +300,7 @@ class Member3Engine:
         request: RecommendationRequest,
     ) -> RecommendationOutcome:
         """
-        Preserve an explicit amount supplied by the user.
-
-        This protects the backend contract from provider-specific
-        unit conversion such as interpreting 100,000 naira as
-        10,000,000 minor units.
+        Convert an explicit whole-naira amount to the backend's minor units.
         """
 
         value = outcome.root
@@ -356,7 +349,7 @@ class Member3Engine:
         ):
             explanation = (
                 f"Recommendation to withdraw "
-                f"{explicit_amount:,} CNGN to your saved bank "
+                f"{explicit_amount // 100:,} CNGN to your saved bank "
                 f"account as requested."
             )
 

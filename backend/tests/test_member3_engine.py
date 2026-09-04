@@ -81,6 +81,7 @@ def test_valid_recommendation():
 
     assert result.root.outcome == "RECOMMENDATION"
     assert result.root.request_id == "req_test_001"
+    assert result.root.parameters.amount_minor == 5_000_000
 
 
 def test_unknown_recipient_is_rejected():

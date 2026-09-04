@@ -1,9 +1,6 @@
 ﻿import os
 
-from .gemini_adapter import GeminiAdapter
-from .groq_adapter import GroqAdapter
 from .llm_adapter import LLMAdapter
-from .resilient_llm_adapter import ResilientLLMAdapter
 
 
 def build_llm_adapter() -> LLMAdapter:
@@ -40,9 +37,14 @@ def build_llm_adapter() -> LLMAdapter:
                 "GEMINI_API_KEY environment variable is not set."
             )
 
+        from .gemini_adapter import GeminiAdapter
+
         primary = GeminiAdapter()
 
         if groq_key:
+            from .groq_adapter import GroqAdapter
+            from .resilient_llm_adapter import ResilientLLMAdapter
+
             return ResilientLLMAdapter(
                 primary=primary,
                 fallback=GroqAdapter(),
@@ -55,6 +57,8 @@ def build_llm_adapter() -> LLMAdapter:
             raise RuntimeError(
                 "GROQ_API_KEY environment variable is not set."
             )
+
+        from .groq_adapter import GroqAdapter
 
         return GroqAdapter()
 
