@@ -43,6 +43,11 @@ ambiguous retryable failure, preventing blind duplicate wallet creation.
 decimal strings to integer minor units using `Decimal`, never binary floating
 point. BMONI's `NGN` balance label is normalized to FlowPilot's `CNGN`.
 
+The sandbox currently returns `smartAccountAddress` and `balances` at the
+response top level, while earlier examples used a `data` envelope. The BMONI
+gateway accepts either vendor shape and normalizes it to one internal envelope
+before balance policy runs. Missing or malformed balance arrays fail closed.
+
 An upstream per-currency read failure is represented as unavailable, not as a
 zero balance. Internal allocation policies can call `available_balance_minor`
 and fail closed when the authoritative balance cannot be read.
@@ -54,6 +59,12 @@ BMONI balance before requesting an `exactIn` NGN-to-USD quote. The response
 includes the quote ID, rate, output, fees, and expiry and explicitly states
 that no money has moved. Quote retrieval never authorizes execution.
 
+FlowPilot validates the vendor currencies and exact input amount, requires
+positive finite decimal amounts/rates, validates every fee, and rejects missing
+or expired quote timestamps before the quote can be used to create a proposal.
+On 4 September 2026, the shared sandbox credentials and the live NGN 1,000 to
+USD quote response were verified without creating a proposal or moving funds.
+
 The proposal approval route is omitted from the current sandbox OpenAPI
 document but is active at
 `POST /v1/users/{userId}/smart-wallets/proposals/{proposalId}/approve`.
@@ -62,11 +73,17 @@ reached the handler and returned BMONI `E501` / `Proposal not found`. FlowPilot
 now treats the guide and verified runtime behavior as authoritative for this
 route. Successful execution still requires a funded wallet and a real proposal.
 
-## Intentionally blocked outside mock mode
+## Current execution boundary
 
 - A bank withdrawal uses the Nigerian beneficiary/offramp sequence.
-- A real stablecoin swap uses BMONI's signed proposal lifecycle. The
-  `exchange/convert` endpoint is a preview calculation, not execution.
+- A real stablecoin swap uses BMONI's signed proposal lifecycle; the backend
+  implements proposal creation, approval, signing-payload retrieval, signature
+  submission, and status reconciliation. The mobile SDK must produce the owner
+  proof and proposal signature, and the sandbox wallet must be funded.
+- The `exchange/convert` endpoint is a preview calculation, not execution and
+  is not used as proof that money moved.
 
-These operations must remain fail-closed until their request and response
-models and mobile signing handoff are implemented from the confirmed schema.
+Bank withdrawals remain fail-closed outside mock mode until the beneficiary and
+offramp request/response models are confirmed. A real swap demo remains blocked
+until the team supplies a funded SDK-controlled sandbox wallet; shared sandbox
+wallets sampled on 4 September 2026 had no positive balance.

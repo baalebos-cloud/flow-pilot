@@ -4,7 +4,8 @@ import hashlib
 import uuid
 
 from dataclasses import dataclass
-from decimal import Decimal
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -319,16 +320,26 @@ class BmoniGateway:
             f"/v1/users/{bmoni_user_id}/smart-wallets/account/balances",
         )
 
-        if not isinstance(result, dict) or not isinstance(
-            result.get("data"),
-            dict,
+        if not isinstance(result, dict):
+            raise BmoniError(
+                "BMONI balance response is invalid",
+                code="BMONI_INVALID_RESPONSE",
+            )
+
+        payload = result.get("data", result)
+
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("balances"), list
         ):
             raise BmoniError(
                 "BMONI balance response is invalid",
                 code="BMONI_INVALID_RESPONSE",
             )
 
-        return result
+        # The sandbox currently returns this payload at the top level while
+        # earlier fixtures used a data envelope. Normalize both at the vendor
+        # boundary so application policy consumes one authoritative shape.
+        return {"data": payload}
 
     def create_managed_wallet(
         self,
@@ -420,7 +431,7 @@ class BmoniGateway:
     ) -> dict:
         """Request a currency-exchange quote from BMONI."""
         if self.mode != "mock":
-            return self._request(
+            result = self._request(
                 "POST",
                 f"/v1/users/{bmoni_user_id}/exchange/quote",
                 json_body={
@@ -432,22 +443,107 @@ class BmoniGateway:
                     "toCurrency": target,
                 },
             )
+        else:
+            amount_out = Decimal(amount_decimal) / Decimal(1600)
 
-        amount_out = Decimal(amount_decimal) / Decimal(1600)
+            result = {
+                "quoteId": f"bm_qte_{uuid.uuid4().hex[:16]}",
+                "fromCurrency": source,
+                "toCurrency": target,
+                "amountIn": amount_decimal,
+                "amountOut": f"{amount_out:.2f}",
+                "exchangeRate": "0.000625",
+                "toUsdExchangeRate": "0.000625",
+                "fees": [],
+                "quotedAt": "2099-01-01T00:00:00.000Z",
+                "expiresAt": "2099-01-01T00:01:00.000Z",
+                "expiresInSeconds": 60,
+            }
 
-        return {
-            "quoteId": f"bm_qte_{uuid.uuid4().hex[:16]}",
-            "fromCurrency": source,
-            "toCurrency": target,
-            "amountIn": amount_decimal,
-            "amountOut": f"{amount_out:.2f}",
-            "exchangeRate": "0.000625",
-            "toUsdExchangeRate": "0.000625",
-            "fees": [],
-            "quotedAt": "2099-01-01T00:00:00.000Z",
-            "expiresAt": "2099-01-01T00:01:00.000Z",
-            "expiresInSeconds": 60,
+        return self._validate_fx_quote(
+            result,
+            amount_decimal=amount_decimal,
+            source=source,
+            target=target,
+        )
+
+    @staticmethod
+    def _validate_fx_quote(
+        result: Any,
+        *,
+        amount_decimal: str,
+        source: str,
+        target: str,
+    ) -> dict:
+        """Fail closed when a quote is malformed, mismatched, or expired."""
+        required = {
+            "quoteId",
+            "fromCurrency",
+            "toCurrency",
+            "amountIn",
+            "amountOut",
+            "exchangeRate",
+            "toUsdExchangeRate",
+            "fees",
+            "quotedAt",
+            "expiresAt",
+            "expiresInSeconds",
         }
+
+        try:
+            if not isinstance(result, dict) or not required.issubset(result):
+                raise ValueError
+
+            if not isinstance(result["quoteId"], str) or not result["quoteId"]:
+                raise ValueError
+
+            if (
+                result["fromCurrency"] != source
+                or result["toCurrency"] != target
+                or Decimal(result["amountIn"]) != Decimal(amount_decimal)
+            ):
+                raise ValueError
+
+            for field in ("amountIn", "amountOut", "exchangeRate", "toUsdExchangeRate"):
+                value = Decimal(result[field])
+                if not value.is_finite() or value <= 0:
+                    raise ValueError
+
+            fees = result["fees"]
+            if not isinstance(fees, list):
+                raise ValueError
+
+            for fee in fees:
+                if not isinstance(fee, dict) or not {"currency", "amount"}.issubset(fee):
+                    raise ValueError
+                fee_amount = Decimal(fee["amount"])
+                if not fee_amount.is_finite() or fee_amount < 0:
+                    raise ValueError
+
+            quoted_at = datetime.fromisoformat(
+                str(result["quotedAt"]).replace("Z", "+00:00")
+            )
+            expires_at = datetime.fromisoformat(
+                str(result["expiresAt"]).replace("Z", "+00:00")
+            )
+            expires_in_seconds = Decimal(str(result["expiresInSeconds"]))
+
+            if (
+                quoted_at.tzinfo is None
+                or expires_at.tzinfo is None
+                or expires_at <= quoted_at
+                or expires_at <= datetime.now(timezone.utc)
+                or not expires_in_seconds.is_finite()
+                or expires_in_seconds <= 0
+            ):
+                raise ValueError
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise BmoniError(
+                "BMONI returned an invalid or expired FX quote",
+                code="BMONI_INVALID_QUOTE",
+            ) from exc
+
+        return result
 
     @staticmethod
     def _proposal(

@@ -165,7 +165,7 @@ app.include_router(build_ai_router(current_user))
 @app.exception_handler(BmoniError)
 async def handle_bmoni_error(request: Request, exc: BmoniError):
     """Normalize BMONI failures into the API error format."""
-    status_code = 503 if exc.retryable else 502
+    status_code = 503 if exc.retryable else exc.status_code
 
     return JSONResponse(
         status_code=status_code,
