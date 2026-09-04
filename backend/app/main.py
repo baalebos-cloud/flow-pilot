@@ -125,12 +125,6 @@ app = FastAPI(
 )
 
 
-@app.get("/health", tags=["system"])
-def health() -> dict[str, str]:
-    """Report that the API process is available."""
-    return {"status": "ok"}
-
-
 security = HTTPBearer()
 
 
@@ -179,11 +173,12 @@ async def handle_bmoni_error(request: Request, exc: BmoniError):
     )
 
 
-@app.get("/health", status_code=200)
-def health_check() -> dict:
-    """Health check endpoint for platform monitoring."""
-    return {"status":"ok","bmoni_mode":"mock"}
-    
+@app.get("/health", status_code=200, tags=["system"])
+def health_check() -> dict[str, str]:
+    """Report that the API process is available."""
+    return {"status": "ok"}
+
+
 @app.post("/v1/auth/register", status_code=201)
 def register(
     payload: RegisterRequest,
