@@ -2,6 +2,13 @@
 
 The authoritative Pydantic models live in `backend/app/ai/contracts.py`. Member 3 must import those models directly and must not maintain a second copy.
 
+The authenticated HTTP entry point is `POST /v1/ai/recommend`. Backend-owned
+context is assembled inside the service; clients submit only the natural-language
+message. Recommendation types without authoritative references are not enabled.
+
+Natural-language currency values are major units. For example, "50,000 naira"
+is normalized to `5_000_000` CNGN minor units before policy validation.
+
 ## Boundary
 
 ```text

@@ -57,3 +57,9 @@ urllib3==2.7.0
 uvicorn==0.35.0
 watchfiles==1.2.0
 websockets==17.1
+SQLAlchemy==2.0.52
+alembic==1.19.1
+psycopg[binary]==3.3.5
+psycopg2-binary>=2.9.9
+google-genai==1.38.0
+groq==1.7.0

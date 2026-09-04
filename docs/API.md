@@ -9,13 +9,21 @@ Interactive documentation is available at `/docs` while the service runs.
 | Method | Route | Purpose |
 |---|---|---|
 | GET | `/health` | Health and integration mode |
-| POST | `/v1/auth/register` | FlowPilot registration plus mock BMONI provisioning |
+| POST | `/v1/auth/register` | FlowPilot registration plus BMONI user provisioning |
 | POST | `/v1/auth/login` | FlowPilot access token |
 | GET | `/v1/me` | Current identity mapping |
 | POST | `/v1/wallets/link` | Link public SDK wallet address |
+| POST | `/v1/wallets/owner-proof-challenges` | Request BMONI EIP-191 ownership message |
+| POST | `/v1/wallets/managed` | Submit device signature and create/recover managed wallet |
+| GET | `/v1/wallets/balances` | Read authoritative BMONI balances normalized to minor units |
+| POST | `/v1/fx/quotes` | Obtain an expiring CNGN-to-USD quote without moving money |
+| POST | `/v1/ai/recommend` | Produce a typed candidate from backend-owned context; never execute it |
 | POST/GET | `/v1/pockets` | Create/list virtual pockets |
 | POST | `/v1/recommendations/currency-shield` | Deterministic eligibility and explanation |
-| POST | `/v1/recommendations/{id}/approve` | Quote and execute approved mock conversion |
+| POST | `/v1/recommendations/{id}/approve` | Revalidate balance, create/approve BMONI SWAP proposal |
+| GET | `/v1/fx/conversions/{id}` | Reconcile conversion status with BMONI |
+| GET | `/v1/fx/conversions/{id}/signing-payload` | Return BMONI hash for on-device signing |
+| POST | `/v1/fx/conversions/{id}/signature` | Submit the device signature to BMONI |
 | POST | `/v1/action-plans` | Legacy withdrawal plan retained for reference demo |
 | POST | `/v1/action-plans/{id}/approve` | Create mock withdrawal proposal |
 | GET | `/v1/transactions/{id}/signing-payload` | Payload for on-device signing |
@@ -29,3 +37,5 @@ Interactive documentation is available at `/docs` while the service runs.
 - Vendor payloads do not leak through the public API.
 - Error responses use stable codes before frontend integration begins.
 - `BMONI_MODE=mock` responses are synthetic and must be labelled in the demo UI.
+- Registration requires `first_name`, `last_name`, and `phone_number` in E.164 form, such as `+2348012345678`.
+- Currency Shield uses BMONI's proposal lifecycle; the backend never receives a PIN or private key.

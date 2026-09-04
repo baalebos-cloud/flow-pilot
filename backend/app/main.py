@@ -1,24 +1,64 @@
 import hashlib
 import hmac
 import json
-import sqlite3
 import uuid
+
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import InvalidTokenError
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
-from app.bmoni import BmoniConfigurationError, bmoni
+from app.ai.router import build_ai_router
+from app.bmoni import BmoniError, bmoni
+from app.balances import (
+    available_balance_minor,
+    fetch_wallet_balances,
+    minor_to_decimal,
+)
 from app.config import settings
-from app.db import connection, init_db, json_text, now_iso, row_dict
+from app.database import session_scope
+from app.models import (
+    ActionPlan,
+    FxConversion,
+    Pocket,
+    Recommendation,
+    Transaction,
+    User,
+    Wallet,
+    WebhookEvent,
+)
+from app.repositories import (
+    add_audit,
+    get_action_plan,
+    get_fx_by_idempotency,
+    get_fx_conversion,
+    get_pocket as get_pocket_record,
+    get_recommendation,
+    get_transaction,
+    get_transaction_by_idempotency,
+    get_transaction_by_proposal,
+    get_user_by_email,
+    get_user_by_id,
+    get_wallet_by_user,
+    get_webhook_event,
+    list_user_pockets,
+    utc_now,
+)
+from app.rate_limit import enforce_rate_limit
 from app.schemas import (
     ActionPlanRequest,
     CurrencyShieldRequest,
+    FxQuoteRequest,
     InvestmentOpportunityResponse,
     LoginRequest,
+    ManagedWalletCreateRequest,
+    OwnerProofChallengeRequest,
     PocketCreateRequest,
     PocketTransferRequest,
+    ProposalSignatureRequest,
     RegisterRequest,
     SignatureRequest,
     TransactionCategorizeRequest,
@@ -30,345 +70,452 @@ from app.security import (
     hash_password,
     verify_password,
 )
+from app.workflow import (
+    ACTION_PLAN_TRANSITIONS,
+    RECOMMENDATION_TRANSITIONS,
+    TRANSACTION_TRANSITIONS,
+    ActionPlanStatus,
+    RecommendationStatus,
+    TransactionStatus,
+    transition,
+)
 
 
-# Seed the read-only investment opportunities for the demo environment.
-def seed_investment_opportunities() -> None:
-    """Create demo investment opportunities when the table is empty."""
-
-    # Insert demo opportunities only once.
-    with connection() as conn:
-        existing = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM investment_opportunities
-            """
-        ).fetchone()
-
-        if existing["count"] > 0:
-            return
-
-        # Store informational opportunities without any execution mechanism.
-        opportunities = [
-            (
-                new_id("inv"),
-                "Verified Treasury Fund",
-                "Demo Regulated Provider",
-                "VERIFIED",
-                "LOW",
-                "DAILY",
-                0,
-                "CNGN",
-                "Read-only demo investment opportunity for the Innovation Fair.",
-                now_iso(),
-            ),
-            (
-                new_id("inv"),
-                "Balanced Growth Fund",
-                "Demo Regulated Provider",
-                "VERIFIED",
-                "MEDIUM",
-                "WEEKLY",
-                500,
-                "CNGN",
-                "Read-only demo opportunity with moderate risk.",
-                now_iso(),
-            ),
-        ]
-
-        conn.executemany(
-            """
-            INSERT INTO investment_opportunities
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            opportunities,
-        )
+SUPPORTED_POCKET_CURRENCIES = {"CNGN", "USD"}
 
 
-# Initialize the database and demo data when the FastAPI application starts.
+def new_id(prefix: str) -> str:
+    """Create a unique application identifier."""
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def model_dict(item) -> dict:
+    """Convert a SQLAlchemy model into a JSON-safe dictionary."""
+    return {
+        column.name: getattr(item, column.name)
+        for column in item.__table__.columns
+    }
+
+
+def _pocket_summary(pocket: Pocket) -> dict:
+    """Return the public summary of a pocket."""
+    return {
+        "id": pocket.id,
+        "name": pocket.name,
+        "purpose": pocket.purpose,
+        "allocated_minor": pocket.allocated_minor,
+        "spent_minor": pocket.spent_minor,
+        "available_minor": pocket.allocated_minor - pocket.spent_minor,
+        "currency": pocket.currency,
+        "protected": pocket.protected,
+        "created_at": pocket.created_at,
+    }
+
+
 @asynccontextmanager
-async def lifespan(_: FastAPI):
-    """Initialize application storage and demo fixtures during startup."""
-
-    # Create all application tables before serving requests.
-    init_db()
-
-    # Seed the read-only investment opportunities for the demo environment.
-    seed_investment_opportunities()
-
+async def lifespan(app: FastAPI):
+    """Keep schema lifecycle under Alembic rather than creating tables here."""
     yield
 
 
 app = FastAPI(
     title="FlowPilot API",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
-bearer = HTTPBearer(auto_error=False)
+
+app.include_router(build_ai_router())
 
 
-# Generate internal identifiers using a readable resource prefix.
-def new_id(prefix: str) -> str:
-    """Return a unique identifier prefixed with the resource type."""
-
-    return f"{prefix}_{uuid.uuid4().hex}"
+security = HTTPBearer()
 
 
-# Resolve the authenticated FlowPilot user from the bearer access token.
 def current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
-) -> dict:
-    """Return the authenticated user or reject the request."""
-
-    # Require a bearer token for protected endpoints.
-    if not credentials:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required",
-        )
-
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> User:
+    """Resolve the authenticated active FlowPilot user."""
     try:
-        # Decode and validate the access token.
-        user_id = decode_access_token(credentials.credentials)
+        payload = decode_access_token(credentials.credentials)
     except InvalidTokenError:
         raise HTTPException(
             status_code=401,
             detail="Invalid or expired access token",
         )
 
-    # Load the user associated with the token.
-    with connection() as conn:
-        user = row_dict(
-            conn.execute(
-                "SELECT * FROM users WHERE id = ?",
-                (user_id,),
-            ).fetchone()
-        )
-
-    # Reject tokens belonging to users that no longer exist.
-    if not user:
+    user_id = payload.get("sub")
+    if not user_id:
         raise HTTPException(
             status_code=401,
-            detail="User no longer exists",
+            detail="Invalid access token",
         )
 
-    return user
+    with session_scope() as session:
+        user = get_user_by_id(session, user_id)
+
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="User not found",
+            )
+
+        if user.provisioning_status != "ACTIVE":
+            raise HTTPException(
+                status_code=409,
+                detail="BMONI user provisioning is not active",
+            )
+
+        session.expunge(user)
+        return user
 
 
-# Convert BMONI configuration failures into a consistent API response.
-@app.exception_handler(BmoniConfigurationError)
-async def bmoni_config_error(
-    _: Request,
-    exc: BmoniConfigurationError,
-):
-    """Return a service-unavailable response for BMONI configuration errors."""
+@app.exception_handler(BmoniError)
+async def handle_bmoni_error(request: Request, exc: BmoniError):
+    """Normalize BMONI failures into the API error format."""
+    status_code = 503 if exc.retryable else 502
 
-    from fastapi.responses import JSONResponse
-
-    return JSONResponse(
-        status_code=503,
-        content={"detail": str(exc)},
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": exc.code,
+            "message": str(exc),
+        },
     )
 
 
-# Provide a lightweight health check for the application.
-@app.get("/health")
-def health() -> dict:
-    """Return the API health status and active BMONI mode."""
-
-    return {
-        "status": "ok",
-        "bmoni_mode": settings.bmoni_mode,
-    }
-
-
-# Register a new FlowPilot user and provision the corresponding BMONI user.
 @app.post("/v1/auth/register", status_code=201)
-def register(payload: RegisterRequest) -> dict:
-    """Create a FlowPilot account and its BMONI user."""
+def register(
+    payload: RegisterRequest,
+    request: Request,
+) -> dict:
+    """Register a FlowPilot user and provision the corresponding BMONI user."""
+    enforce_rate_limit(
+        request,
+        scope="auth-register",
+        limit=settings.auth_rate_limit_per_minute,
+        window_seconds=60,
+    )
 
+    email = str(payload.email).lower()
     user_id = new_id("usr")
 
-    # Reject duplicate local accounts before calling BMONI.
-    with connection() as conn:
-        if conn.execute(
-            "SELECT 1 FROM users WHERE email = ?",
-            (str(payload.email).lower(),),
-        ).fetchone():
-            raise HTTPException(
-                status_code=409,
-                detail="A FlowPilot account with this email already exists",
-            )
-
     try:
-        # Provision the user in BMONI with the phone number required by its API.
-        remote = bmoni.create_user(
-            external_id=user_id,
-            email=str(payload.email),
-            name=payload.name,
-            phone_number=payload.phone_number,
-        )
+        with session_scope() as session:
+            if get_user_by_email(session, email):
+                raise HTTPException(
+                    status_code=409,
+                    detail="A FlowPilot account with this email already exists",
+                )
 
-        # Save the local account after BMONI provisioning succeeds.
-        with connection() as conn:
-            conn.execute(
-                "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    user_id,
-                    str(payload.email).lower(),
-                    payload.name,
-                    hash_password(payload.password),
-                    remote["id"],
-                    now_iso(),
-                ),
+            session.add(
+                User(
+                    id=user_id,
+                    email=email,
+                    name=f"{payload.first_name} {payload.last_name}",
+                    password_hash=hash_password(payload.password),
+                    provisioning_status="PENDING",
+                    created_at=utc_now(),
+                )
             )
-
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         raise HTTPException(
             status_code=409,
             detail="A FlowPilot account with this email already exists",
         )
 
+    try:
+        remote = bmoni.create_user(
+            external_id=user_id,
+            email=email,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            phone_number=payload.phone_number,
+        )
+    except Exception:
+        with session_scope() as session:
+            user = get_user_by_id(session, user_id)
+            if user:
+                user.provisioning_status = "FAILED"
+        raise
+
+    with session_scope() as session:
+        user = get_user_by_id(session, user_id)
+
+        if not user:
+            raise HTTPException(
+                status_code=500,
+                detail="Provisioned user record disappeared",
+            )
+
+        user.bmoni_user_id = remote["id"]
+        user.provisioning_status = "ACTIVE"
+
+        add_audit(
+            session,
+            event_id=new_id("aud"),
+            actor_user_id=user.id,
+            action="AUTH_REGISTER",
+            resource_type="USER",
+            resource_id=user.id,
+            outcome="SUCCESS",
+        )
+
+        session.flush()
+
+        result = model_dict(user)
+        result.pop("password_hash", None)
+
     return {
         "access_token": create_access_token(user_id),
         "token_type": "bearer",
-        "user": {
-            "id": user_id,
-            "email": str(payload.email),
-            "name": payload.name,
-            "bmoni_user_id": remote["id"],
-        },
+        "user": result,
     }
 
 
-# Authenticate an existing FlowPilot user.
 @app.post("/v1/auth/login")
-def login(payload: LoginRequest) -> dict:
-    """Authenticate a user and return an access token."""
+def login(
+    payload: LoginRequest,
+    request: Request,
+) -> dict:
+    """Authenticate an active FlowPilot user."""
+    enforce_rate_limit(
+        request,
+        scope="auth-login",
+        limit=settings.auth_rate_limit_per_minute,
+        window_seconds=60,
+    )
 
-    # Load the account by normalized email.
-    with connection() as conn:
-        user = row_dict(
-            conn.execute(
-                "SELECT * FROM users WHERE email = ?",
-                (str(payload.email).lower(),),
-            ).fetchone()
-        )
+    email = str(payload.email).lower()
 
-    # Reject invalid credentials without revealing which credential failed.
-    if not user or not verify_password(
-        payload.password,
-        user["password_hash"],
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password",
-        )
+    with session_scope() as session:
+        user = get_user_by_email(session, email)
+
+        if not user or not verify_password(
+            payload.password,
+            user.password_hash,
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid email or password",
+            )
+
+        if user.provisioning_status != "ACTIVE":
+            raise HTTPException(
+                status_code=409,
+                detail="BMONI user provisioning is not active",
+            )
+
+        result = model_dict(user)
+        result.pop("password_hash", None)
 
     return {
-        "access_token": create_access_token(user["id"]),
+        "access_token": create_access_token(user.id),
         "token_type": "bearer",
+        "user": result,
     }
 
 
-# Return the authenticated user's profile.
-@app.get("/v1/me")
-def me(user: dict = Depends(current_user)) -> dict:
-    """Return the current authenticated user's profile."""
-
-    return {
-        key: user[key]
-        for key in (
-            "id",
-            "email",
-            "name",
-            "bmoni_user_id",
-            "created_at",
-        )
-    }
+@app.get("/v1/auth/me")
+def me(user: User = Depends(current_user)) -> dict:
+    """Return the authenticated user's profile."""
+    result = model_dict(user)
+    result.pop("password_hash", None)
+    return result
 
 
-# Link a CNGN wallet to the authenticated user.
 @app.post("/v1/wallets/link", status_code=201)
 def link_wallet(
     payload: WalletLinkRequest,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Link a supported wallet to the authenticated user."""
-
+    """Link a user's external wallet."""
     currency = payload.currency.upper()
 
-    # The current MVP only supports CNGN wallets.
-    if currency != "CNGN":
-        raise HTTPException(
-            status_code=422,
-            detail="The MVP currently supports CNGN only",
-        )
+    with session_scope() as session:
+        existing = get_wallet_by_user(session, user.id)
 
-    # Ask BMONI to link the wallet.
-    remote = bmoni.link_wallet(
-        bmoni_user_id=user["bmoni_user_id"],
-        address=payload.wallet_address,
-        currency=currency,
-    )
-
-    wallet_id = new_id("wal")
-
-    try:
-        # Save the linked wallet locally.
-        with connection() as conn:
-            conn.execute(
-                "INSERT INTO wallets VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    wallet_id,
-                    user["id"],
-                    remote["id"],
-                    payload.wallet_address,
-                    currency,
-                    remote["status"],
-                    now_iso(),
-                ),
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail="A wallet is already linked to this account",
             )
 
-    except sqlite3.IntegrityError:
-        raise HTTPException(
-            status_code=409,
-            detail="This user or wallet address is already linked",
+        wallet = Wallet(
+            id=new_id("wal"),
+            user_id=user.id,
+            wallet_address=payload.wallet_address,
+            currency=currency,
+            status="LINKED",
+            created_at=utc_now(),
         )
 
+        session.add(wallet)
+        session.flush()
+
+        return model_dict(wallet)
+
+
+@app.post("/v1/wallets/owner-proof/challenge")
+def create_owner_proof_challenge(
+    payload: OwnerProofChallengeRequest,
+    user: User = Depends(current_user),
+) -> dict:
+    """Create a BMONI owner-proof challenge."""
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
+
+    return bmoni.create_owner_proof_challenge(
+        bmoni_user_id=user.bmoni_user_id,
+        owner_address=payload.owner_address,
+        currency=payload.currency.upper(),
+    )
+
+
+@app.post("/v1/wallets/managed", status_code=201)
+def create_managed_wallet(
+    payload: ManagedWalletCreateRequest,
+    user: User = Depends(current_user),
+) -> dict:
+    """Create a managed BMONI wallet after owner verification."""
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
+
+    remote = bmoni.create_managed_wallet(
+        bmoni_user_id=user.bmoni_user_id,
+        owner_address=payload.owner_address,
+        currency=payload.currency.upper(),
+        challenge_id=payload.challenge_id,
+        signature=payload.signature,
+    )
+
+    with session_scope() as session:
+        wallet = get_wallet_by_user(session, user.id)
+
+        if wallet is None:
+            wallet = Wallet(
+                id=new_id("wal"),
+                user_id=user.id,
+                wallet_address=payload.owner_address,
+                currency=payload.currency.upper(),
+                status="ACTIVE",
+                created_at=utc_now(),
+            )
+            session.add(wallet)
+
+        wallet.bmoni_wallet_id = remote["id"]
+        wallet.status = "ACTIVE"
+
+        session.flush()
+
+        return model_dict(wallet)
+
+
+@app.get("/v1/wallets")
+def list_wallets(user: User = Depends(current_user)) -> dict:
+    """List wallets belonging to the authenticated BMONI user."""
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
+
+    return bmoni.list_wallets(
+        bmoni_user_id=user.bmoni_user_id,
+    )
+
+
+@app.get("/v1/wallets/balances")
+def wallet_balances(user: User = Depends(current_user)) -> dict:
+    """Return authoritative wallet balances from BMONI."""
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
+
+    balances = fetch_wallet_balances(
+        bmoni,
+        bmoni_user_id=user.bmoni_user_id,
+    )
+
     return {
-        "id": wallet_id,
-        "bmoni_wallet_id": remote["id"],
-        "status": remote["status"],
-        "currency": currency,
+        "balances": [
+            balance.model_dump()
+            for balance in balances
+        ]
     }
 
 
-# Create a risk-checked action plan before any money movement.
+@app.post("/v1/fx/quotes")
+def create_fx_quote(
+    payload: FxQuoteRequest,
+    user: User = Depends(current_user),
+) -> dict:
+    """Create an FX quote after checking authoritative balance."""
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
+
+    source = payload.source_currency.upper()
+    target = payload.target_currency.upper()
+
+    if (source, target) != ("CNGN", "USD"):
+        raise HTTPException(
+            status_code=422,
+            detail="The MVP supports CNGN to USD only",
+        )
+
+    balance_minor = available_balance_minor(
+        bmoni,
+        bmoni_user_id=user.bmoni_user_id,
+        currency=source,
+    )
+
+    if payload.amount_minor > balance_minor:
+        raise HTTPException(
+            status_code=422,
+            detail="Insufficient authoritative balance",
+        )
+
+    quote = bmoni.get_fx_quote(
+        bmoni_user_id=user.bmoni_user_id,
+        amount_decimal=minor_to_decimal(
+            payload.amount_minor,
+            "NGN",
+        ),
+        source="NGN",
+        target=target,
+    )
+
+    return quote
+
+
 @app.post("/v1/action-plans", status_code=201)
 def create_action_plan(
     payload: ActionPlanRequest,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Create a withdrawal action plan after applying risk checks."""
-
+    """Create an action plan after applying transaction safety rules."""
     currency = payload.currency.upper()
     failures = []
 
-    # Reject currencies unsupported by the current MVP.
     if currency != "CNGN":
         failures.append("UNSUPPORTED_CURRENCY")
 
-    # Reject withdrawals larger than the supplied available balance.
     if payload.amount_minor > payload.available_balance_minor:
         failures.append("INSUFFICIENT_BALANCE")
 
-    # Enforce the application-level transaction limit.
     if payload.amount_minor > settings.max_transaction_minor:
         failures.append("PER_TRANSACTION_LIMIT_EXCEEDED")
 
-    # Return all detected risk failures together.
     if failures:
         raise HTTPException(
             status_code=422,
@@ -380,83 +527,72 @@ def create_action_plan(
 
     plan_id = new_id("plan")
     expected = (
-        payload.available_balance_minor - payload.amount_minor
+        payload.available_balance_minor
+        - payload.amount_minor
     )
 
-    # Store the action plan without moving money.
-    with connection() as conn:
-        conn.execute(
-            "INSERT INTO action_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                plan_id,
-                user["id"],
-                "BANK_WITHDRAWAL",
-                payload.amount_minor,
-                currency,
-                payload.recipient_name,
-                payload.message,
-                payload.available_balance_minor,
-                expected,
-                "PASSED",
-                "AWAITING_USER_APPROVAL",
-                now_iso(),
-            ),
+    with session_scope() as session:
+        session.add(
+            ActionPlan(
+                id=plan_id,
+                user_id=user.id,
+                action_type="PAYMENT",
+                amount_minor=payload.amount_minor,
+                currency=currency,
+                recipient_name=payload.recipient_name,
+                reason=payload.message,
+                available_balance_minor=payload.available_balance_minor,
+                expected_balance_minor=expected,
+                risk_status="APPROVED",
+                approval_status="AWAITING_USER_APPROVAL",
+                created_at=utc_now(),
+            )
         )
 
     return {
         "id": plan_id,
-        "action_type": "BANK_WITHDRAWAL",
-        "amount_minor": payload.amount_minor,
-        "currency": currency,
-        "recipient_name": payload.recipient_name,
-        "available_balance_minor": payload.available_balance_minor,
-        "expected_balance_minor": expected,
-        "risk_status": "PASSED",
+        "risk_status": "APPROVED",
         "approval_status": "AWAITING_USER_APPROVAL",
-        "requires_user_approval": True,
-        "money_has_moved": False,
+        "expected_balance_minor": expected,
     }
 
 
-# Approve an action plan and create the corresponding BMONI withdrawal proposal.
 @app.post("/v1/action-plans/{plan_id}/approve", status_code=201)
 def approve_action_plan(
     plan_id: str,
+    request: Request,
     idempotency_key: str = Header(
         min_length=8,
         max_length=128,
         alias="Idempotency-Key",
     ),
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Approve a withdrawal action plan idempotently."""
+    """Approve an action plan and create a BMONI withdrawal proposal."""
+    enforce_rate_limit(
+        request,
+        scope=f"financial-approval:{user.id}",
+        limit=settings.financial_rate_limit_per_minute,
+        window_seconds=60,
+    )
 
-    with connection() as conn:
-        # Return an existing transaction for a repeated idempotency key.
-        existing = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM transactions
-                WHERE user_id = ? AND idempotency_key = ?
-                """,
-                (user["id"], idempotency_key),
-            ).fetchone()
+    with session_scope() as session:
+        existing = get_transaction_by_idempotency(
+            session,
+            user.id,
+            idempotency_key,
         )
 
         if existing:
-            return existing
+            return model_dict(existing)
 
-        # Load the action plan while enforcing ownership.
-        plan = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM action_plans
-                WHERE id = ? AND user_id = ?
-                """,
-                (plan_id, user["id"]),
-            ).fetchone()
+        plan = session.scalar(
+            select(ActionPlan)
+            .where(
+                ActionPlan.id == plan_id,
+                ActionPlan.user_id == user.id,
+            )
+            .with_for_update()
         )
 
         if not plan:
@@ -465,1042 +601,779 @@ def approve_action_plan(
                 detail="Action plan not found",
             )
 
-        # Prevent an action plan from being approved twice.
-        if plan["approval_status"] != "AWAITING_USER_APPROVAL":
+        if plan.approval_status != ActionPlanStatus.AWAITING_USER_APPROVAL:
             raise HTTPException(
                 status_code=409,
-                detail="Action plan cannot be approved in its current state",
+                detail="Action plan cannot be approved",
             )
 
-        # Create the BMONI withdrawal proposal after explicit user approval.
-        proposal = bmoni.create_withdrawal_proposal(
-            bmoni_user_id=user["bmoni_user_id"],
-            amount_minor=plan["amount_minor"],
-            currency=plan["currency"],
-            recipient_name=plan["recipient_name"],
+        plan.approval_status = transition(
+            plan.approval_status,
+            ActionPlanStatus.CREATING_PROPOSAL,
+            ACTION_PLAN_TRANSITIONS,
         )
 
-        transaction_id = new_id("txn")
+        wallet = get_wallet_by_user(session, user.id)
 
-        # Mark the action plan approved and store the pending transaction.
-        conn.execute(
-            """
-            UPDATE action_plans
-            SET approval_status = 'APPROVED'
-            WHERE id = ?
-            """,
-            (plan_id,),
-        )
+        if not wallet or not wallet.bmoni_wallet_id:
+            raise HTTPException(
+                status_code=409,
+                detail="A managed BMONI wallet is required",
+            )
 
-        conn.execute(
-            "INSERT INTO transactions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
-            (
-                transaction_id,
-                user["id"],
-                plan_id,
-                proposal["id"],
-                plan["amount_minor"],
-                plan["currency"],
-                "PENDING_SIGNATURE",
-                proposal["status"],
-                idempotency_key,
-                now_iso(),
-            ),
-        )
-
-    return {
-        "id": transaction_id,
-        "bmoni_proposal_id": proposal["id"],
-        "status": "PENDING_SIGNATURE",
-    }
-
-
-# Load a transaction while enforcing ownership.
-def owned_transaction(
-    transaction_id: str,
-    user_id: str,
-) -> dict:
-    """Return a transaction belonging to the supplied user."""
-
-    with connection() as conn:
-        transaction = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM transactions
-                WHERE id = ? AND user_id = ?
-                """,
-                (transaction_id, user_id),
-            ).fetchone()
-        )
-
-    if not transaction:
-        raise HTTPException(
-            status_code=404,
-            detail="Transaction not found",
-        )
-
-    return transaction
-
-
-# Return one transaction owned by the authenticated user.
-@app.get("/v1/transactions/{transaction_id}")
-def get_transaction(
-    transaction_id: str,
-    user: dict = Depends(current_user),
-) -> dict:
-    """Return an authenticated user's transaction."""
-
-    return owned_transaction(transaction_id, user["id"])
-
-
-# Return the BMONI signing payload for a pending transaction.
-@app.get("/v1/transactions/{transaction_id}/signing-payload")
-def signing_payload(
-    transaction_id: str,
-    user: dict = Depends(current_user),
-) -> dict:
-    """Return the signing payload for a pending transaction."""
-
-    transaction = owned_transaction(
-        transaction_id,
-        user["id"],
-    )
-
-    if transaction["status"] != "PENDING_SIGNATURE":
-        raise HTTPException(
-            status_code=409,
-            detail="Transaction is not awaiting a signature",
-        )
-
-    return bmoni.get_signing_payload(
-        proposal_id=transaction["bmoni_proposal_id"]
-    )
-
-
-# Submit a user signature to BMONI for a pending transaction.
-@app.post("/v1/transactions/{transaction_id}/signature")
-def submit_signature(
-    transaction_id: str,
-    payload: SignatureRequest,
-    user: dict = Depends(current_user),
-) -> dict:
-    """Submit a transaction signature and update its local status."""
-
-    transaction = owned_transaction(
-        transaction_id,
-        user["id"],
-    )
-
-    if transaction["status"] != "PENDING_SIGNATURE":
-        raise HTTPException(
-            status_code=409,
-            detail="Transaction is not awaiting a signature",
+        snapshot = (
+            plan.amount_minor,
+            plan.currency,
+            plan.recipient_name,
+            user.bmoni_user_id,
+            wallet.bmoni_wallet_id,
         )
 
     try:
-        # Submit the user's signature to BMONI.
-        remote = bmoni.submit_signature(
-            proposal_id=transaction["bmoni_proposal_id"],
-            signature=payload.signature,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=str(exc),
-        )
+        if not snapshot[3]:
+            raise HTTPException(
+                status_code=409,
+                detail="BMONI user provisioning is incomplete",
+            )
 
-    # Translate BMONI status into the local transaction status.
-    local_status = (
-        "COMPLETED"
-        if remote["status"] == "COMPLETED"
-        else "PROCESSING"
-    )
-
-    completed_at = (
-        now_iso()
-        if local_status == "COMPLETED"
-        else None
-    )
-
-    # Persist the resulting transaction state.
-    with connection() as conn:
-        conn.execute(
-            """
-            UPDATE transactions
-            SET status = ?, bmoni_status = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            (
-                local_status,
-                remote["status"],
-                completed_at,
-                transaction_id,
+        remote = bmoni.create_withdrawal_proposal(
+            bmoni_user_id=snapshot[3],
+            smart_wallet_id=snapshot[4],
+            amount_decimal=minor_to_decimal(
+                snapshot[0],
+                "NGN",
             ),
+            currency=snapshot[1],
+            recipient_name=snapshot[2],
+            idempotency_key=idempotency_key,
+        )
+
+        proposal_id = remote["data"]["proposal"]["id"]
+
+    except Exception:
+        with session_scope() as session:
+            failed_plan = get_action_plan(
+                session,
+                plan_id,
+                user.id,
+            )
+
+            if (
+                failed_plan
+                and failed_plan.approval_status
+                == ActionPlanStatus.CREATING_PROPOSAL
+            ):
+                failed_plan.approval_status = transition(
+                    failed_plan.approval_status,
+                    ActionPlanStatus.FAILED,
+                    ACTION_PLAN_TRANSITIONS,
+                )
+
+        raise
+
+    transaction_id = new_id("txn")
+
+    with session_scope() as session:
+        plan = get_action_plan(
+            session,
+            plan_id,
+            user.id,
+        )
+
+        if not plan:
+            raise HTTPException(
+                status_code=404,
+                detail="Action plan not found",
+            )
+
+        plan.approval_status = transition(
+            plan.approval_status,
+            ActionPlanStatus.AWAITING_USER_SIGNATURE,
+            ACTION_PLAN_TRANSITIONS,
+        )
+
+        transaction = Transaction(
+            id=transaction_id,
+            user_id=user.id,
+            action_plan_id=plan_id,
+            bmoni_proposal_id=proposal_id,
+            amount_minor=snapshot[0],
+            currency=snapshot[1],
+            status=TransactionStatus.PENDING_SIGNATURE,
+            bmoni_status="PENDING_SIGNATURES",
+            idempotency_key=idempotency_key,
+            created_at=utc_now(),
+        )
+
+        session.add(transaction)
+
+        add_audit(
+            session,
+            event_id=new_id("aud"),
+            actor_user_id=user.id,
+            action="ACTION_PLAN_APPROVE",
+            resource_type="TRANSACTION",
+            resource_id=transaction_id,
+            outcome="PENDING_SIGNATURE",
         )
 
     return {
         "id": transaction_id,
-        "status": local_status,
-        "bmoni_status": remote["status"],
+        "action_plan_id": plan_id,
+        "bmoni_proposal_id": proposal_id,
+        "status": TransactionStatus.PENDING_SIGNATURE,
+        "money_has_moved": False,
     }
 
 
-# Categorize a transaction belonging to the authenticated user.
-@app.patch("/v1/transactions/{transaction_id}/category")
-def categorize_transaction(
+def owned_transaction(
     transaction_id: str,
-    payload: TransactionCategorizeRequest,
-    user: dict = Depends(current_user),
-) -> dict:
-    """Assign a category to a user's transaction."""
+    user_id: str,
+) -> Transaction:
+    """Load a transaction while enforcing ownership."""
+    with session_scope() as session:
+        item = get_transaction(
+            session,
+            transaction_id,
+            user_id,
+        )
 
-    # Load the transaction while enforcing ownership.
-    with connection() as conn:
-        transaction = conn.execute(
-            """
-            SELECT *
-            FROM transactions
-            WHERE id = ? AND user_id = ?
-            """,
-            (transaction_id, user["id"]),
-        ).fetchone()
-
-        # Prevent users from accessing another user's transaction.
-        if transaction is None:
+        if not item:
             raise HTTPException(
                 status_code=404,
                 detail="Transaction not found",
             )
 
-        # Save the normalized category.
-        category = payload.category.strip().lower()
+        session.expunge(item)
+        return item
 
-        conn.execute(
-            """
-            UPDATE transactions
-            SET category = ?
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                category,
-                transaction_id,
-                user["id"],
-            ),
+
+@app.get("/v1/transactions/{transaction_id}")
+def read_transaction(
+    transaction_id: str,
+    user: User = Depends(current_user),
+) -> dict:
+    """Return a user's transaction."""
+    return model_dict(
+        owned_transaction(
+            transaction_id,
+            user.id,
+        )
+    )
+
+
+@app.get("/v1/transactions/{transaction_id}/signing-payload")
+def transaction_signing_payload(
+    transaction_id: str,
+    user: User = Depends(current_user),
+) -> dict:
+    """Return the BMONI signing payload for a pending transaction."""
+    item = owned_transaction(
+        transaction_id,
+        user.id,
+    )
+
+    if item.status != TransactionStatus.PENDING_SIGNATURE:
+        raise HTTPException(
+            status_code=409,
+            detail="Transaction is not awaiting a signature",
         )
 
-        # Return the updated transaction.
-        updated = conn.execute(
-            """
-            SELECT *
-            FROM transactions
-            WHERE id = ? AND user_id = ?
-            """,
-            (transaction_id, user["id"]),
-        ).fetchone()
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
 
-    return row_dict(updated)
+    return bmoni.get_proposal_signing_payload(
+        bmoni_user_id=user.bmoni_user_id,
+        proposal_id=item.bmoni_proposal_id,
+    )
 
 
-# Receive asynchronous transaction status updates from BMONI.
-@app.post("/v1/webhooks/bmoni")
-async def bmoni_webhook(
+@app.post("/v1/transactions/{transaction_id}/signature")
+def submit_transaction_signature(
+    transaction_id: str,
+    payload: SignatureRequest,
     request: Request,
-    x_bmoni_signature: str | None = Header(default=None),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Process authenticated BMONI webhook events idempotently."""
+    """Submit a signature for a pending BMONI withdrawal proposal."""
+    enforce_rate_limit(
+        request,
+        scope=f"financial-signature:{user.id}",
+        limit=settings.financial_rate_limit_per_minute,
+        window_seconds=60,
+    )
 
-    raw = await request.body()
+    item = owned_transaction(
+        transaction_id,
+        user.id,
+    )
 
-    # Validate the webhook signature when a secret is configured.
-    if settings.bmoni_webhook_secret:
-        expected = hmac.new(
-            settings.bmoni_webhook_secret.encode(),
-            raw,
-            hashlib.sha256,
-        ).hexdigest()
+    if item.status != TransactionStatus.PENDING_SIGNATURE:
+        raise HTTPException(
+            status_code=409,
+            detail="Transaction is not awaiting a signature",
+        )
 
-        if not x_bmoni_signature or not hmac.compare_digest(
-            x_bmoni_signature,
-            expected,
-        ):
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
+
+    remote = bmoni.submit_proposal_signature(
+        bmoni_user_id=user.bmoni_user_id,
+        proposal_id=item.bmoni_proposal_id,
+        signature=payload.signature,
+    )
+
+    remote_status = remote["data"]["proposal"]["status"]
+
+    with session_scope() as session:
+        transaction = get_transaction(
+            session,
+            transaction_id,
+            user.id,
+        )
+
+        if not transaction:
             raise HTTPException(
-                status_code=401,
-                detail="Invalid webhook signature",
+                status_code=404,
+                detail="Transaction not found",
             )
 
-    # Require a secret outside local development.
-    elif settings.environment != "development":
-        raise HTTPException(
-            status_code=503,
-            detail="Webhook secret is not configured",
+        transaction.bmoni_status = remote_status
+
+        if remote_status == "COMPLETED":
+            transaction.status = TransactionStatus.COMPLETED
+            transaction.completed_at = utc_now()
+
+        elif remote_status == "FAILED":
+            transaction.status = TransactionStatus.FAILED
+
+        else:
+            transaction.status = TransactionStatus.PROCESSING
+
+        add_audit(
+            session,
+            event_id=new_id("aud"),
+            actor_user_id=user.id,
+            action="TRANSACTION_SIGNATURE_SUBMIT",
+            resource_type="TRANSACTION",
+            resource_id=transaction_id,
+            outcome=transaction.status,
         )
 
-    try:
-        # Parse the webhook payload.
-        event = json.loads(raw)
-        event_id = str(event["id"])
-        event_type = str(event["type"])
-        proposal_id = str(event["proposal_id"])
-        remote_status = str(event["status"])
+        return model_dict(transaction)
 
-    except (ValueError, KeyError, TypeError):
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid webhook payload",
+
+@app.patch("/v1/transactions/{transaction_id}/category")
+def categorize_transaction(
+    transaction_id: str,
+    payload: TransactionCategorizeRequest,
+    user: User = Depends(current_user),
+) -> dict:
+    """Assign a normalized category to a user's transaction."""
+    with session_scope() as session:
+        transaction = get_transaction(
+            session,
+            transaction_id,
+            user.id,
         )
 
-    with connection() as conn:
-        # Ignore already-processed webhook events.
-        if conn.execute(
-            "SELECT 1 FROM webhook_events WHERE id = ?",
-            (event_id,),
-        ).fetchone():
-            return {
-                "received": True,
-                "duplicate": True,
-            }
+        if not transaction:
+            raise HTTPException(
+                status_code=404,
+                detail="Transaction not found",
+            )
 
-        # Translate remote BMONI statuses into local transaction statuses.
-        mapping = {
-            "COMPLETED": "COMPLETED",
-            "FAILED": "FAILED",
-            "PENDING": "PROCESSING",
-        }
+        transaction.category = payload.category.strip().lower()
 
-        local_status = mapping.get(
-            remote_status,
-            "PROCESSING",
-        )
+        session.flush()
 
-        completed_at = (
-            now_iso()
-            if local_status == "COMPLETED"
-            else None
-        )
-
-        # Update the transaction associated with the BMONI proposal.
-        conn.execute(
-            """
-            UPDATE transactions
-            SET status = ?, bmoni_status = ?, completed_at = ?
-            WHERE bmoni_proposal_id = ?
-            """,
-            (
-                local_status,
-                remote_status,
-                completed_at,
-                proposal_id,
-            ),
-        )
-
-        # Record the event so duplicate webhooks are ignored.
-        conn.execute(
-            "INSERT INTO webhook_events VALUES (?, ?, ?, ?, 1, ?)",
-            (
-                event_id,
-                event_type,
-                proposal_id,
-                json_text(event),
-                now_iso(),
-            ),
-        )
-
-    return {
-        "received": True,
-        "duplicate": False,
-    }
+        return model_dict(transaction)
 
 
-# Provide the wallet balance used by pocket allocation validation.
 def get_authoritative_wallet_balance(
-    user: dict,
+    user: User,
     currency: str,
 ) -> int:
-    """Return the authoritative wallet balance in integer minor units.
+    """Return the authoritative wallet balance from the BMONI balance service."""
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
 
-    This temporary provider remains separate from pocket logic so the shared
-    BMONI balance service can replace it without changing allocation validation.
-    """
+    return available_balance_minor(
+        bmoni,
+        bmoni_user_id=user.bmoni_user_id,
+        currency=currency,
+    )
 
-    # Return the temporary development balance until the BMONI balance service is connected.
-    return 100_000_000
 
-
-# Validate a pocket allocation against an authoritative backend balance.
 def validate_pocket_allocation(
-    user: dict,
+    session,
+    user_id: str,
     currency: str,
     requested_allocation_minor: int,
     wallet_balance_minor: int,
     exclude_pocket_id: str | None = None,
 ) -> None:
-    """Reject an allocation when aggregate pocket allocations exceed wallet balance."""
-
-    # Calculate the total amount already allocated to this user's pockets in this currency.
-    with connection() as conn:
-        if exclude_pocket_id:
-            row = conn.execute(
-                """
-                SELECT COALESCE(SUM(allocated_minor), 0) AS total_allocated_minor
-                FROM pockets
-                WHERE user_id = ?
-                  AND currency = ?
-                  AND id != ?
-                """,
-                (
-                    user["id"],
-                    currency,
-                    exclude_pocket_id,
-                ),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                """
-                SELECT COALESCE(SUM(allocated_minor), 0) AS total_allocated_minor
-                FROM pockets
-                WHERE user_id = ?
-                  AND currency = ?
-                """,
-                (
-                    user["id"],
-                    currency,
-                ),
-            ).fetchone()
-
-    # Keep all balance calculations in integer minor units.
-    existing_allocated_minor = int(
-        row["total_allocated_minor"]
+    """Reject an aggregate pocket allocation above authoritative balance."""
+    statement = select(
+        func.coalesce(
+            func.sum(Pocket.allocated_minor),
+            0,
+        )
+    ).where(
+        Pocket.user_id == user_id,
+        Pocket.currency == currency,
     )
 
-    # Calculate the aggregate allocation after applying the requested amount.
+    if exclude_pocket_id:
+        statement = statement.where(
+            Pocket.id != exclude_pocket_id
+        )
+
+    existing_allocated_minor = int(
+        session.scalar(statement) or 0
+    )
+
     total_allocated_minor = (
         existing_allocated_minor
         + requested_allocation_minor
     )
 
-    # Reject the request when aggregate allocation exceeds the authoritative balance.
     if total_allocated_minor > wallet_balance_minor:
         raise HTTPException(
             status_code=422,
             detail={
                 "code": "POCKET_ALLOCATION_EXCEEDS_BALANCE",
                 "message": (
-                    "Total pocket allocation exceeds the "
-                    "authoritative wallet balance"
+                    "Total pocket allocation exceeds "
+                    "the authoritative wallet balance"
                 ),
                 "currency": currency,
-                "requested_allocation_minor": requested_allocation_minor,
-                "existing_allocated_minor": existing_allocated_minor,
+                "requested_allocation_minor": (
+                    requested_allocation_minor
+                ),
+                "existing_allocated_minor": (
+                    existing_allocated_minor
+                ),
                 "wallet_balance_minor": wallet_balance_minor,
             },
         )
 
 
-# Create a pocket after validating its allocation against the authoritative wallet balance.
 @app.post("/v1/pockets", status_code=201)
 def create_pocket(
     payload: PocketCreateRequest,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Create a new spending pocket after validating its aggregate allocation."""
-
-    # Normalize the currency before applying currency-specific validation.
+    """Create a user-owned pocket after allocation validation."""
     currency = payload.currency.upper()
 
-    # Restrict pocket allocations to currencies currently supported by the application.
-    if currency not in {"CNGN", "USD"}:
+    if currency not in SUPPORTED_POCKET_CURRENCIES:
         raise HTTPException(
             status_code=422,
-            detail="Unsupported pocket currency",
+            detail={
+                "code": "UNSUPPORTED_CURRENCY",
+                "message": "Pocket currency is not supported",
+            },
         )
 
-    # Retrieve the authoritative balance from the backend balance provider.
     wallet_balance_minor = get_authoritative_wallet_balance(
-        user=user,
-        currency=currency,
+        user,
+        currency,
     )
 
-    # Validate the new allocation against all existing allocations in this currency.
-    validate_pocket_allocation(
-        user=user,
-        currency=currency,
-        requested_allocation_minor=payload.allocated_minor,
-        wallet_balance_minor=wallet_balance_minor,
-    )
+    with session_scope() as session:
+        validate_pocket_allocation(
+            session=session,
+            user_id=user.id,
+            currency=currency,
+            requested_allocation_minor=payload.allocated_minor,
+            wallet_balance_minor=wallet_balance_minor,
+        )
 
-    pocket_id = new_id("pkt")
+        pocket = Pocket(
+            id=new_id("pocket"),
+            user_id=user.id,
+            name=payload.name.strip(),
+            purpose=payload.purpose.strip(),
+            allocated_minor=payload.allocated_minor,
+            spent_minor=0,
+            currency=currency,
+            protected=payload.protected,
+            created_at=utc_now(),
+        )
 
-    try:
-        # Save the pocket only after all allocation checks have passed.
-        with connection() as conn:
-            conn.execute(
-                "INSERT INTO pockets VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
-                (
-                    pocket_id,
-                    user["id"],
-                    payload.name,
-                    payload.purpose,
-                    payload.allocated_minor,
-                    currency,
-                    int(payload.protected),
-                    now_iso(),
-                ),
+        session.add(pocket)
+
+        try:
+            session.flush()
+        except IntegrityError:
+            raise HTTPException(
+                status_code=409,
+                detail="A pocket with this name already exists",
             )
 
-    except sqlite3.IntegrityError:
-        # Prevent duplicate pocket names for the same user.
-        raise HTTPException(
-            status_code=409,
-            detail="A pocket with this name already exists",
-        )
-
-    return {
-        "id": pocket_id,
-        "name": payload.name,
-        "purpose": payload.purpose,
-        "allocated_minor": payload.allocated_minor,
-        "spent_minor": 0,
-        "available_minor": payload.allocated_minor,
-        "currency": currency,
-        "protected": payload.protected,
-        "created_at": now_iso(),
-    }
+        return _pocket_summary(pocket)
 
 
-# Return all pockets owned by the authenticated user with calculated balances.
 @app.get("/v1/pockets")
 def list_pockets(
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[dict]:
-    """Return every pocket owned by the authenticated user."""
-
-    # Load only pockets belonging to the authenticated user.
-    with connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM pockets
-            WHERE user_id = ?
-            ORDER BY created_at
-            """,
-            (user["id"],),
-        ).fetchall()
-
-    # Convert each database row into the frontend pocket summary contract.
-    return [
-        {
-            "id": row["id"],
-            "name": row["name"],
-            "purpose": row["purpose"],
-            "allocated_minor": row["allocated_minor"],
-            "spent_minor": row["spent_minor"],
-            "available_minor": (
-                row["allocated_minor"]
-                - row["spent_minor"]
-            ),
-            "currency": row["currency"],
-            "protected": bool(row["protected"]),
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
+    """List all pockets owned by the authenticated user."""
+    with session_scope() as session:
+        return [
+            _pocket_summary(item)
+            for item in list_user_pockets(
+                session,
+                user.id,
+            )
+        ]
 
 
-# Return one pocket owned by the authenticated user with its current balance summary.
 @app.get("/v1/pockets/{pocket_id}")
-def get_pocket(
+def read_pocket(
     pocket_id: str,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Return a single pocket and its balance summary."""
-
-    # Query by both pocket ID and user ID to enforce ownership.
-    with connection() as conn:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM pockets
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                pocket_id,
-                user["id"],
-            ),
-        ).fetchone()
-
-    # Hide whether a pocket exists for another user.
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail="Pocket not found",
+    """Return one user-owned pocket."""
+    with session_scope() as session:
+        pocket = get_pocket_record(
+            session,
+            pocket_id,
+            user.id,
         )
 
-    # Calculate the amount remaining in the pocket.
-    available_minor = (
-        row["allocated_minor"]
-        - row["spent_minor"]
-    )
+        if not pocket:
+            raise HTTPException(
+                status_code=404,
+                detail="Pocket not found",
+            )
 
-    return {
-        "id": row["id"],
-        "name": row["name"],
-        "purpose": row["purpose"],
-        "allocated_minor": row["allocated_minor"],
-        "spent_minor": row["spent_minor"],
-        "available_minor": available_minor,
-        "currency": row["currency"],
-        "protected": bool(row["protected"]),
-        "created_at": row["created_at"],
-    }
+        return _pocket_summary(pocket)
 
 
-# Update an editable pocket while preserving its spending history.
 @app.patch("/v1/pockets/{pocket_id}")
 def update_pocket(
     pocket_id: str,
     payload: PocketCreateRequest,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Update a user's pocket while preserving its current spending history."""
-
-    # Normalize the requested currency before validation.
+    """Update a user-owned pocket while preserving spending history."""
     currency = payload.currency.upper()
 
-    # Restrict pockets to currently supported currencies.
-    if currency not in {"CNGN", "USD"}:
+    if currency not in SUPPORTED_POCKET_CURRENCIES:
         raise HTTPException(
             status_code=422,
-            detail="Unsupported pocket currency",
+            detail={
+                "code": "UNSUPPORTED_CURRENCY",
+                "message": "Pocket currency is not supported",
+            },
         )
 
-    # Load the pocket while enforcing ownership.
-    with connection() as conn:
-        pocket = conn.execute(
-            """
-            SELECT *
-            FROM pockets
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                pocket_id,
-                user["id"],
-            ),
-        ).fetchone()
-
-    # Return not found when the pocket does not belong to the user.
-    if not pocket:
-        raise HTTPException(
-            status_code=404,
-            detail="Pocket not found",
-        )
-
-    # Do not reduce allocation below money already spent.
-    if payload.allocated_minor < pocket["spent_minor"]:
-        raise HTTPException(
-            status_code=422,
-            detail="Allocated amount cannot be less than the amount already spent",
-        )
-
-    # Retrieve the authoritative balance for the requested currency.
     wallet_balance_minor = get_authoritative_wallet_balance(
-        user=user,
-        currency=currency,
+        user,
+        currency,
     )
 
-    # Validate aggregate allocation while excluding the current pocket.
-    validate_pocket_allocation(
-        user=user,
-        currency=currency,
-        requested_allocation_minor=payload.allocated_minor,
-        wallet_balance_minor=wallet_balance_minor,
-        exclude_pocket_id=pocket_id,
-    )
+    with session_scope() as session:
+        pocket = get_pocket_record(
+            session,
+            pocket_id,
+            user.id,
+        )
 
-    try:
-        # Update only this user's pocket.
-        with connection() as conn:
-            conn.execute(
-                """
-                UPDATE pockets
-                SET name = ?,
-                    purpose = ?,
-                    allocated_minor = ?,
-                    currency = ?,
-                    protected = ?
-                WHERE id = ? AND user_id = ?
-                """,
-                (
-                    payload.name,
-                    payload.purpose,
-                    payload.allocated_minor,
-                    currency,
-                    int(payload.protected),
-                    pocket_id,
-                    user["id"],
+        if not pocket:
+            raise HTTPException(
+                status_code=404,
+                detail="Pocket not found",
+            )
+
+        if payload.allocated_minor < pocket.spent_minor:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Pocket allocation cannot be below "
+                    "the amount already spent"
                 ),
             )
 
-    except sqlite3.IntegrityError:
-        # Prevent duplicate pocket names.
-        raise HTTPException(
-            status_code=409,
-            detail="A pocket with this name already exists",
+        validate_pocket_allocation(
+            session=session,
+            user_id=user.id,
+            currency=currency,
+            requested_allocation_minor=payload.allocated_minor,
+            wallet_balance_minor=wallet_balance_minor,
+            exclude_pocket_id=pocket.id,
         )
 
-    return {
-        "id": pocket_id,
-        "name": payload.name,
-        "purpose": payload.purpose,
-        "allocated_minor": payload.allocated_minor,
-        "spent_minor": pocket["spent_minor"],
-        "available_minor": (
-            payload.allocated_minor
-            - pocket["spent_minor"]
-        ),
-        "currency": currency,
-        "protected": payload.protected,
-        "created_at": pocket["created_at"],
-    }
+        pocket.name = payload.name.strip()
+        pocket.purpose = payload.purpose.strip()
+        pocket.allocated_minor = payload.allocated_minor
+        pocket.currency = currency
+        pocket.protected = payload.protected
+
+        try:
+            session.flush()
+        except IntegrityError:
+            raise HTTPException(
+                status_code=409,
+                detail="A pocket with this name already exists",
+            )
+
+        return _pocket_summary(pocket)
 
 
-# Delete a pocket owned by the authenticated user.
 @app.delete("/v1/pockets/{pocket_id}", status_code=204)
 def delete_pocket(
     pocket_id: str,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> None:
-    """Delete a pocket when it has not been used for spending."""
-
-    # Load the pocket through the authenticated user's ID.
-    with connection() as conn:
-        pocket = conn.execute(
-            """
-            SELECT *
-            FROM pockets
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                pocket_id,
-                user["id"],
-            ),
-        ).fetchone()
-
-    # Do not reveal another user's pocket.
-    if not pocket:
-        raise HTTPException(
-            status_code=404,
-            detail="Pocket not found",
+    """Delete a user-owned pocket that has no spending history."""
+    with session_scope() as session:
+        pocket = get_pocket_record(
+            session,
+            pocket_id,
+            user.id,
         )
 
-    # Prevent deletion after spending has occurred.
-    if pocket["spent_minor"] > 0:
-        raise HTTPException(
-            status_code=409,
-            detail="A pocket with spending history cannot be deleted",
-        )
-
-    try:
-        # Delete only the authenticated user's pocket.
-        with connection() as conn:
-            conn.execute(
-                """
-                DELETE FROM pockets
-                WHERE id = ? AND user_id = ?
-                """,
-                (
-                    pocket_id,
-                    user["id"],
-                ),
+        if not pocket:
+            raise HTTPException(
+                status_code=404,
+                detail="Pocket not found",
             )
 
-    except sqlite3.IntegrityError:
-        # Keep referenced pockets safe.
-        raise HTTPException(
-            status_code=409,
-            detail="This pocket cannot be deleted because it is already referenced",
-        )
+        if pocket.spent_minor > 0:
+            raise HTTPException(
+                status_code=409,
+                detail="A pocket with spending history cannot be deleted",
+            )
+
+        session.delete(pocket)
 
 
-# Transfer allocated funds between two pockets owned by the authenticated user.
 @app.post("/v1/pockets/transfer")
 def transfer_pocket(
     payload: PocketTransferRequest,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Transfer allocated funds from one user-owned pocket to another."""
-
-    # Prevent a meaningless transfer to the same pocket.
-    if payload.source_pocket_id == payload.destination_pocket_id:
+    """Transfer allocated funds between two pockets owned by the same user."""
+    if (
+        payload.source_pocket_id
+        == payload.destination_pocket_id
+    ):
         raise HTTPException(
             status_code=422,
             detail="Source and destination pockets must be different",
         )
 
-    # Load both pockets while enforcing ownership.
-    with connection() as conn:
-        source = conn.execute(
-            """
-            SELECT *
-            FROM pockets
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                payload.source_pocket_id,
-                user["id"],
-            ),
-        ).fetchone()
+    with session_scope() as session:
+        source = get_pocket_record(
+            session,
+            payload.source_pocket_id,
+            user.id,
+        )
+        destination = get_pocket_record(
+            session,
+            payload.destination_pocket_id,
+            user.id,
+        )
 
-        destination = conn.execute(
-            """
-            SELECT *
-            FROM pockets
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                payload.destination_pocket_id,
-                user["id"],
-            ),
-        ).fetchone()
-
-        # Reject missing or cross-user pockets.
         if source is None or destination is None:
             raise HTTPException(
                 status_code=404,
                 detail="Source or destination pocket not found",
             )
 
-        # Transfers must remain within the same currency.
-        if source["currency"] != destination["currency"]:
+        if source.currency != destination.currency:
             raise HTTPException(
                 status_code=422,
                 detail={
                     "code": "CURRENCY_MISMATCH",
-                    "message": "Pocket transfers must use the same currency",
+                    "message": (
+                        "Pocket transfers must use "
+                        "the same currency"
+                    ),
                 },
             )
 
-        # Calculate the source pocket's available amount.
         source_available_minor = (
-            source["allocated_minor"]
-            - source["spent_minor"]
+            source.allocated_minor
+            - source.spent_minor
         )
 
-        # Prevent transferring more than the source can provide.
         if payload.amount_minor > source_available_minor:
             raise HTTPException(
                 status_code=422,
                 detail={
                     "code": "INSUFFICIENT_POCKET_BALANCE",
-                    "message": "Source pocket does not have enough available balance",
+                    "message": (
+                        "Source pocket does not have "
+                        "enough available balance"
+                    ),
                     "available_minor": source_available_minor,
                     "requested_minor": payload.amount_minor,
                 },
             )
 
-        # Move allocation while preserving spending history.
         new_source_allocation = (
-            source["allocated_minor"]
+            source.allocated_minor
             - payload.amount_minor
         )
 
         new_destination_allocation = (
-            destination["allocated_minor"]
+            destination.allocated_minor
             + payload.amount_minor
         )
 
-        # Never allow allocation below money already spent.
-        if new_source_allocation < source["spent_minor"]:
+        if new_source_allocation < source.spent_minor:
             raise HTTPException(
                 status_code=422,
-                detail="Transfer would reduce the source allocation below its spent amount",
+                detail=(
+                    "Transfer would reduce the source "
+                    "allocation below its spent amount"
+                ),
             )
 
-        # Apply both sides inside the same database transaction.
-        conn.execute(
-            """
-            UPDATE pockets
-            SET allocated_minor = ?
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                new_source_allocation,
-                source["id"],
-                user["id"],
-            ),
+        source.allocated_minor = new_source_allocation
+        destination.allocated_minor = (
+            new_destination_allocation
         )
 
-        conn.execute(
-            """
-            UPDATE pockets
-            SET allocated_minor = ?
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                new_destination_allocation,
-                destination["id"],
-                user["id"],
-            ),
-        )
+        session.flush()
 
-    return {
-        "source": {
-            "id": source["id"],
-            "allocated_minor": new_source_allocation,
-            "spent_minor": source["spent_minor"],
-            "available_minor": (
-                new_source_allocation
-                - source["spent_minor"]
-            ),
-            "currency": source["currency"],
-        },
-        "destination": {
-            "id": destination["id"],
-            "allocated_minor": new_destination_allocation,
-            "spent_minor": destination["spent_minor"],
-            "available_minor": (
-                new_destination_allocation
-                - destination["spent_minor"]
-            ),
-            "currency": destination["currency"],
-        },
-        "amount_minor": payload.amount_minor,
-    }
+        return {
+            "source": _pocket_summary(source),
+            "destination": _pocket_summary(destination),
+            "amount_minor": payload.amount_minor,
+        }
 
 
-# Create a Currency Shield recommendation without immediately moving money.
-@app.post("/v1/recommendations/currency-shield", status_code=201)
+@app.post(
+    "/v1/recommendations/currency-shield",
+    status_code=201,
+)
 def create_currency_shield(
     payload: CurrencyShieldRequest,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Create a Currency Shield recommendation after safety checks."""
-
-    # Load the pocket while enforcing ownership.
-    with connection() as conn:
-        pocket = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM pockets
-                WHERE id = ? AND user_id = ?
-                """,
-                (
-                    payload.pocket_id,
-                    user["id"],
-                ),
-            ).fetchone()
+    """Create a Currency Shield recommendation without moving money."""
+    with session_scope() as session:
+        pocket = get_pocket_record(
+            session,
+            payload.pocket_id,
+            user.id,
         )
 
-    if not pocket:
-        raise HTTPException(
-            status_code=404,
-            detail="Pocket not found",
-        )
-
-    # Calculate the current available pocket balance.
-    available = (
-        pocket["allocated_minor"]
-        - pocket["spent_minor"]
-    )
-
-    # Limit Currency Shield to the configured percentage of available funds.
-    maximum = (
-        available
-        * settings.max_fx_conversion_percent
-        // 100
-    )
-
-    reasons = []
-
-   # Prevent protected pockets from funding Currency Shield.
-    if pocket["protected"]:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "PROTECTED_POCKET",
-                "message": "Protected pockets cannot fund Currency Shield",
-            },
-        )
-
-    # The current MVP supports only CNGN to USD.
-    if (
-        pocket["currency"] != "CNGN"
-        or payload.target_currency.upper() != "USD"
-    ):
-        reasons.append("UNSUPPORTED_PAIR")
-
-    # Enforce the Currency Shield safety limit.
-    if payload.amount_minor > maximum:
-        reasons.append("AMOUNT_EXCEEDS_SAFETY_LIMIT")
-
-    # Only recommend conversion after the configured depreciation threshold is reached.
-    if payload.observed_change_bps > -settings.fx_alert_threshold_bps:
-        reasons.append("ALERT_THRESHOLD_NOT_REACHED")
-
-    if reasons:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "status": "NOT_RECOMMENDED",
-                "reasons": reasons,
-            },
-        )
-
-    recommendation_id = new_id("rec")
-
-    evidence = {
-        "observed_change_bps": payload.observed_change_bps,
-        "observation_window_days": payload.observation_window_days,
-        "max_conversion_percent": settings.max_fx_conversion_percent,
-    }
-
-    rationale = (
-        f"CNGN changed "
-        f"{abs(payload.observed_change_bps) / 100:.2f}% "
-        f"over {payload.observation_window_days} days. "
-        f"Consider diversifying part of this pocket."
-    )
-
-    disclosure = (
-        "Rates can move in either direction. "
-        "Conversion may include fees or spread. "
-        "No money moves without approval."
-    )
-
-    # Store the recommendation without executing the conversion.
-    with connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO recommendations
-            VALUES (
-                ?,
-                ?,
-                ?,
-                'CURRENCY_SHIELD',
-                'AWAITING_APPROVAL',
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                NULL,
-                ?
+        if not pocket:
+            raise HTTPException(
+                status_code=404,
+                detail="Pocket not found",
             )
-            """,
-            (
-                recommendation_id,
-                user["id"],
-                pocket["id"],
-                pocket["currency"],
-                payload.target_currency.upper(),
-                payload.amount_minor,
-                rationale,
-                disclosure,
-                json_text(evidence),
-                now_iso(),
+
+        available = (
+            pocket.allocated_minor
+            - pocket.spent_minor
+        )
+
+        maximum = (
+            available
+            * settings.max_fx_conversion_percent
+            // 100
+        )
+
+        if pocket.protected:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "PROTECTED_POCKET",
+                    "message": (
+                        "Protected pockets cannot fund "
+                        "Currency Shield"
+                    ),
+                },
+            )
+
+        reasons = []
+
+        if (
+            pocket.currency != "CNGN"
+            or payload.target_currency.upper() != "USD"
+        ):
+            reasons.append("UNSUPPORTED_PAIR")
+
+        if payload.amount_minor > maximum:
+            reasons.append(
+                "AMOUNT_EXCEEDS_SAFETY_LIMIT"
+            )
+
+        if (
+            payload.observed_change_bps
+            > -settings.fx_alert_threshold_bps
+        ):
+            reasons.append(
+                "ALERT_THRESHOLD_NOT_REACHED"
+            )
+
+        if reasons:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "status": "NOT_RECOMMENDED",
+                    "reasons": reasons,
+                },
+            )
+
+        recommendation_id = new_id("rec")
+
+        evidence = {
+            "observed_change_bps": (
+                payload.observed_change_bps
             ),
+            "observation_window_days": (
+                payload.observation_window_days
+            ),
+            "max_conversion_percent": (
+                settings.max_fx_conversion_percent
+            ),
+        }
+
+        rationale = (
+            f"CNGN changed "
+            f"{abs(payload.observed_change_bps) / 100:.2f}% "
+            f"over {payload.observation_window_days} days. "
+            "Consider diversifying part of this pocket."
+        )
+
+        disclosure = (
+            "Rates can move in either direction. "
+            "Conversion may include fees or spread. "
+            "No money moves without approval."
+        )
+
+        session.add(
+            Recommendation(
+                id=recommendation_id,
+                user_id=user.id,
+                pocket_id=pocket.id,
+                type="CURRENCY_SHIELD",
+                status="AWAITING_APPROVAL",
+                source_currency=pocket.currency,
+                target_currency=payload.target_currency.upper(),
+                amount_minor=payload.amount_minor,
+                rationale=rationale,
+                risk_disclosure=disclosure,
+                evidence_json=json.dumps(evidence),
+                created_at=utc_now(),
+            )
         )
 
     return {
@@ -1513,211 +1386,661 @@ def create_currency_shield(
     }
 
 
-# Approve and execute an existing Currency Shield recommendation.
-@app.post("/v1/recommendations/{recommendation_id}/approve", status_code=201)
+@app.post(
+    "/v1/recommendations/{recommendation_id}/approve",
+    status_code=201,
+)
 def approve_currency_shield(
     recommendation_id: str,
+    request: Request,
     idempotency_key: str = Header(
         min_length=8,
         max_length=128,
         alias="Idempotency-Key",
     ),
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Approve a Currency Shield recommendation after revalidating its pocket."""
+    """Approve a Currency Shield recommendation and create a signing proposal."""
+    enforce_rate_limit(
+        request,
+        scope=f"financial-fx:{user.id}",
+        limit=settings.financial_rate_limit_per_minute,
+        window_seconds=60,
+    )
 
-    with connection() as conn:
-        # Return an existing conversion for repeated idempotency keys.
-        existing = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM fx_conversions
-                WHERE user_id = ? AND idempotency_key = ?
-                """,
-                (
-                    user["id"],
-                    idempotency_key,
-                ),
-            ).fetchone()
+    with session_scope() as session:
+        existing = get_fx_by_idempotency(
+            session,
+            user.id,
+            idempotency_key,
         )
 
         if existing:
-            return existing
-
-        # Load the recommendation while enforcing ownership.
-        recommendation = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM recommendations
-                WHERE id = ? AND user_id = ?
-                """,
-                (
-                    recommendation_id,
-                    user["id"],
+            return {
+                "id": existing.id,
+                "bmoni_proposal_id": (
+                    existing.bmoni_conversion_id
                 ),
-            ).fetchone()
+                "status": existing.status,
+                "quote": json.loads(
+                    existing.quote_json
+                ),
+                "money_has_moved": (
+                    existing.status == "COMPLETED"
+                ),
+            }
+
+        wallet = get_wallet_by_user(
+            session,
+            user.id,
         )
 
-    if not recommendation:
-        raise HTTPException(
-            status_code=404,
-            detail="Recommendation not found",
+        if (
+            not wallet
+            or not wallet.bmoni_wallet_id
+            or not user.bmoni_user_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="A managed BMONI wallet is required",
+            )
+
+        recommendation = session.scalar(
+            select(Recommendation)
+            .where(
+                Recommendation.id == recommendation_id,
+                Recommendation.user_id == user.id,
+            )
+            .with_for_update()
         )
 
-    # Prevent already processed recommendations from being approved again.
-    if recommendation["status"] != "AWAITING_APPROVAL":
+        if not recommendation:
+            raise HTTPException(
+                status_code=404,
+                detail="Recommendation not found",
+            )
+
+        if (
+            recommendation.status
+            != RecommendationStatus.AWAITING_APPROVAL
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Recommendation cannot be approved",
+            )
+
+        recommendation.status = transition(
+            recommendation.status,
+            RecommendationStatus.EXECUTING,
+            RECOMMENDATION_TRANSITIONS,
+        )
+
+        snapshot = (
+            recommendation.amount_minor,
+            recommendation.source_currency,
+            recommendation.target_currency,
+            user.bmoni_user_id,
+            wallet.bmoni_wallet_id,
+        )
+
+    if (
+        snapshot[0] is None
+        or snapshot[1] is None
+        or snapshot[2] is None
+    ):
         raise HTTPException(
             status_code=409,
-            detail="Recommendation cannot be approved",
+            detail="Recommendation is incomplete",
         )
 
-    # Re-fetch the pocket to validate its current state at approval time.
-    with connection() as conn:
-        pocket = conn.execute(
-            """
-            SELECT *
-            FROM pockets
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                recommendation["pocket_id"],
-                user["id"],
+    try:
+        balance = available_balance_minor(
+            bmoni,
+            bmoni_user_id=snapshot[3],
+            currency=snapshot[1],
+        )
+
+        if snapshot[0] > balance:
+            raise HTTPException(
+                status_code=422,
+                detail="Insufficient authoritative wallet balance",
+            )
+
+        quote = bmoni.get_fx_quote(
+            bmoni_user_id=snapshot[3],
+            amount_decimal=minor_to_decimal(
+                snapshot[0],
+                "NGN",
             ),
-        ).fetchone()
-
-    # Reject approval if the pocket no longer exists or belongs to another user.
-    if pocket is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Pocket not found",
+            source="NGN",
+            target=snapshot[2],
         )
 
-    # Prevent protected pockets from funding Currency Shield.
-    if bool(pocket["protected"]):
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "PROTECTED_POCKET",
-                "message": "Protected pockets cannot fund Currency Shield",
-            },
-        )
-
-    # Calculate the pocket's currently available amount.
-    available_minor = (
-        pocket["allocated_minor"]
-        - pocket["spent_minor"]
-    )
-
-    # Prevent approval when the pocket no longer has enough available funds.
-    if recommendation["amount_minor"] > available_minor:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "INSUFFICIENT_POCKET_BALANCE",
-                "message": "Pocket does not have enough available balance",
-                "available_minor": available_minor,
-                "requested_minor": recommendation["amount_minor"],
-            },
-        )
-
-    # Request the exchange quote using the authenticated BMONI user context.
-    quote = bmoni.get_fx_quote(
-        user_id=user["bmoni_user_id"],
-        amount_minor=recommendation["amount_minor"],
-        source=recommendation["source_currency"],
-        target=recommendation["target_currency"],
-    )
-
-    # Execute the approved conversion for the authenticated BMONI user.
-    remote = bmoni.execute_fx_conversion(
-        user_id=user["bmoni_user_id"],
-        quote_id=quote["id"],
-        idempotency_key=idempotency_key,
-    )
-
-    # Record the source-currency amount spent from the pocket after successful conversion.
-    with connection() as conn:
-        conn.execute(
-            """
-            UPDATE pockets
-            SET spent_minor = spent_minor + ?
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                recommendation["amount_minor"],
-                recommendation["pocket_id"],
-                user["id"],
+        created = bmoni.create_swap_proposal(
+            bmoni_user_id=snapshot[3],
+            smart_wallet_id=snapshot[4],
+            amount_decimal=minor_to_decimal(
+                snapshot[0],
+                snapshot[1],
+            ),
+            from_stablecoin=snapshot[1],
+            to_stablecoin=(
+                "USDB"
+                if snapshot[2] == "USD"
+                else snapshot[2]
             ),
         )
+
+        proposal_id = (
+            created["data"]["proposal"]["id"]
+        )
+
+        approved = bmoni.approve_proposal(
+            bmoni_user_id=snapshot[3],
+            proposal_id=proposal_id,
+        )
+
+        remote_status = (
+            approved["data"]["proposal"]["status"]
+        )
+
+        if remote_status != "PENDING_SIGNATURES":
+            raise BmoniError(
+                "BMONI proposal is not ready for signing",
+                code="BMONI_UNEXPECTED_PROPOSAL_STATUS",
+            )
+
+    except Exception as exc:
+        ambiguous = (
+            isinstance(exc, BmoniError)
+            and exc.retryable
+        )
+
+        with session_scope() as session:
+            failed_recommendation = get_recommendation(
+                session,
+                recommendation_id,
+                user.id,
+            )
+
+            if (
+                not ambiguous
+                and failed_recommendation
+                and failed_recommendation.status
+                == RecommendationStatus.EXECUTING
+            ):
+                failed_recommendation.status = transition(
+                    failed_recommendation.status,
+                    RecommendationStatus.FAILED,
+                    RECOMMENDATION_TRANSITIONS,
+                )
+
+                add_audit(
+                    session,
+                    event_id=new_id("aud"),
+                    actor_user_id=user.id,
+                    action="FX_CONVERSION_APPROVE",
+                    resource_type="RECOMMENDATION",
+                    resource_id=recommendation_id,
+                    outcome="FAILED",
+                )
+
+        raise
 
     conversion_id = new_id("fx")
 
-    completed_at = (
-        now_iso()
-        if remote["status"] == "COMPLETED"
-        else None
-    )
-
-    # Mark the recommendation executed and record the BMONI conversion.
-    with connection() as conn:
-        conn.execute(
-            """
-            UPDATE recommendations
-            SET status = 'EXECUTED'
-            WHERE id = ?
-            """,
-            (recommendation_id,),
+    with session_scope() as session:
+        recommendation = get_recommendation(
+            session,
+            recommendation_id,
+            user.id,
         )
 
-        conn.execute(
-            """
-            INSERT INTO fx_conversions
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                conversion_id,
-                user["id"],
-                recommendation_id,
-                remote["id"],
-                remote["status"],
-                recommendation["amount_minor"],
-                recommendation["source_currency"],
-                recommendation["target_currency"],
-                json_text(quote),
-                idempotency_key,
-                now_iso(),
-                completed_at,
-            ),
+        if not recommendation:
+            raise HTTPException(
+                status_code=404,
+                detail="Recommendation not found",
+            )
+
+        session.add(
+            FxConversion(
+                id=conversion_id,
+                user_id=user.id,
+                recommendation_id=recommendation_id,
+                bmoni_conversion_id=proposal_id,
+                status="PENDING_SIGNATURE",
+                source_amount_minor=snapshot[0],
+                source_currency=snapshot[1],
+                target_currency=snapshot[2],
+                quote_json=json.dumps(quote),
+                idempotency_key=idempotency_key,
+                created_at=utc_now(),
+                completed_at=None,
+            )
+        )
+
+        add_audit(
+            session,
+            event_id=new_id("aud"),
+            actor_user_id=user.id,
+            action="FX_CONVERSION_APPROVE",
+            resource_type="FX_CONVERSION",
+            resource_id=conversion_id,
+            outcome="PENDING_SIGNATURE",
         )
 
     return {
         "id": conversion_id,
-        "status": remote["status"],
+        "bmoni_proposal_id": proposal_id,
+        "status": "PENDING_SIGNATURE",
         "quote": quote,
+        "money_has_moved": False,
     }
 
 
-# Expose verified investment opportunities without allowing investment execution.
+def _reconcile_fx(
+    conversion: FxConversion,
+    recommendation: Recommendation,
+    remote: dict,
+) -> None:
+    """Map the remote BMONI proposal status into local workflow state."""
+    remote_status = remote["data"]["proposal"]["status"]
+
+    status_map = {
+        "PENDING_APPROVALS": "PROCESSING",
+        "PENDING_SIGNATURES": "PENDING_SIGNATURE",
+        "COMPLETED": "COMPLETED",
+        "FAILED": "FAILED",
+    }
+
+    conversion.status = status_map.get(
+        remote_status,
+        "PROCESSING",
+    )
+
+    if (
+        conversion.status == "COMPLETED"
+        and recommendation.status
+        == RecommendationStatus.EXECUTING
+    ):
+        recommendation.status = transition(
+            recommendation.status,
+            RecommendationStatus.EXECUTED,
+            RECOMMENDATION_TRANSITIONS,
+        )
+
+        conversion.completed_at = utc_now()
+
+    elif (
+        conversion.status == "FAILED"
+        and recommendation.status
+        == RecommendationStatus.EXECUTING
+    ):
+        recommendation.status = transition(
+            recommendation.status,
+            RecommendationStatus.FAILED,
+            RECOMMENDATION_TRANSITIONS,
+        )
+
+
+@app.get("/v1/fx/conversions/{conversion_id}")
+def get_currency_shield_conversion(
+    conversion_id: str,
+    user: User = Depends(current_user),
+) -> dict:
+    """Return and reconcile a Currency Shield conversion."""
+    with session_scope() as session:
+        conversion = get_fx_conversion(
+            session,
+            conversion_id,
+            user.id,
+        )
+
+        if not conversion:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversion not found",
+            )
+
+        recommendation = get_recommendation(
+            session,
+            conversion.recommendation_id,
+            user.id,
+        )
+
+        if not recommendation:
+            raise HTTPException(
+                status_code=404,
+                detail="Recommendation not found",
+            )
+
+        remote = bmoni.get_proposal(
+            bmoni_user_id=user.bmoni_user_id or "",
+            proposal_id=conversion.bmoni_conversion_id,
+        )
+
+        _reconcile_fx(
+            conversion,
+            recommendation,
+            remote,
+        )
+
+        return {
+            "id": conversion.id,
+            "bmoni_proposal_id": (
+                conversion.bmoni_conversion_id
+            ),
+            "status": conversion.status,
+            "money_has_moved": (
+                conversion.status == "COMPLETED"
+            ),
+        }
+
+
+@app.get(
+    "/v1/fx/conversions/{conversion_id}/signing-payload"
+)
+def currency_shield_signing_payload(
+    conversion_id: str,
+    user: User = Depends(current_user),
+) -> dict:
+    """Return the BMONI signing payload for a Currency Shield conversion."""
+    with session_scope() as session:
+        conversion = get_fx_conversion(
+            session,
+            conversion_id,
+            user.id,
+        )
+
+        if not conversion:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversion not found",
+            )
+
+        if conversion.status != "PENDING_SIGNATURE":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Conversion is not awaiting "
+                    "a signature"
+                ),
+            )
+
+        proposal_id = conversion.bmoni_conversion_id
+
+    result = bmoni.get_proposal_signing_payload(
+        bmoni_user_id=user.bmoni_user_id or "",
+        proposal_id=proposal_id,
+    )
+
+    return result["data"]
+
+
+@app.post(
+    "/v1/fx/conversions/{conversion_id}/signature"
+)
+def submit_currency_shield_signature(
+    conversion_id: str,
+    payload: ProposalSignatureRequest,
+    request: Request,
+    user: User = Depends(current_user),
+) -> dict:
+    """Submit a signature for a Currency Shield proposal."""
+    enforce_rate_limit(
+        request,
+        scope=f"financial-fx-signature:{user.id}",
+        limit=settings.financial_rate_limit_per_minute,
+        window_seconds=60,
+    )
+
+    with session_scope() as session:
+        conversion = get_fx_conversion(
+            session,
+            conversion_id,
+            user.id,
+        )
+
+        if not conversion:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversion not found",
+            )
+
+        if conversion.status != "PENDING_SIGNATURE":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Conversion is not awaiting "
+                    "a signature"
+                ),
+            )
+
+        proposal_id = conversion.bmoni_conversion_id
+
+    remote = bmoni.submit_proposal_signature(
+        bmoni_user_id=user.bmoni_user_id or "",
+        proposal_id=proposal_id,
+        signature=payload.signature,
+    )
+
+    with session_scope() as session:
+        conversion = get_fx_conversion(
+            session,
+            conversion_id,
+            user.id,
+        )
+
+        if not conversion:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversion not found",
+            )
+
+        recommendation = get_recommendation(
+            session,
+            conversion.recommendation_id,
+            user.id,
+        )
+
+        if not recommendation:
+            raise HTTPException(
+                status_code=404,
+                detail="Recommendation not found",
+            )
+
+        _reconcile_fx(
+            conversion,
+            recommendation,
+            remote,
+        )
+
+        add_audit(
+            session,
+            event_id=new_id("aud"),
+            actor_user_id=user.id,
+            action="FX_SIGNATURE_SUBMIT",
+            resource_type="FX_CONVERSION",
+            resource_id=conversion_id,
+            outcome=conversion.status,
+        )
+
+        return {
+            "id": conversion.id,
+            "bmoni_proposal_id": proposal_id,
+            "status": conversion.status,
+            "money_has_moved": (
+                conversion.status == "COMPLETED"
+            ),
+        }
+
+
+@app.post("/v1/webhooks/bmoni")
+async def bmoni_webhook(
+    request: Request,
+    x_webhook_signature: str | None = Header(
+        default=None,
+        alias="X-Webhook-Signature",
+    ),
+    x_webhook_id: str | None = Header(
+        default=None,
+        alias="X-Webhook-Id",
+    ),
+    x_source_event_id: str | None = Header(
+        default=None,
+        alias="X-Source-Event-Id",
+    ),
+) -> dict:
+    """Process an idempotent BMONI webhook event."""
+    body = await request.body()
+
+    expected_signature = hmac.new(
+        settings.bmoni_webhook_secret.encode(),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not x_webhook_signature or not hmac.compare_digest(
+        expected_signature,
+        x_webhook_signature,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid webhook signature",
+        )
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook payload",
+        )
+
+    event_id = payload.get("id")
+
+    if not event_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Webhook event id is required",
+        )
+
+    if (
+        x_webhook_id
+        and x_webhook_id != event_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Webhook id does not match event payload",
+        )
+
+    event_type = payload.get(
+        "eventType",
+        "UNKNOWN",
+    )
+
+    event_payload = payload.get(
+        "payload",
+        {},
+    )
+
+    proposal_id = (
+        event_payload.get("proposalId")
+        or event_payload.get("proposal_id")
+        or event_payload.get("withdrawalId")
+    )
+
+    remote_status = (
+        event_payload.get("status")
+        or payload.get("status")
+    )
+
+    with session_scope() as session:
+        existing = get_webhook_event(
+            session,
+            event_id,
+        )
+
+        if existing:
+            return {
+                "status": "already_processed"
+            }
+
+        session.add(
+            WebhookEvent(
+                id=event_id,
+                event_type=event_type,
+                external_id=x_source_event_id or event_id,
+                payload_json=body.decode(
+                    "utf-8",
+                    errors="replace",
+                ),
+                processed=False,
+                created_at=utc_now(),
+            )
+        )
+
+        if proposal_id:
+            transaction = get_transaction_by_proposal(
+                session,
+                proposal_id,
+            )
+
+            if transaction:
+                transaction.bmoni_status = (
+                    remote_status
+                    or transaction.bmoni_status
+                )
+
+                if remote_status == "COMPLETED":
+                    transaction.status = (
+                        TransactionStatus.COMPLETED
+                    )
+                    transaction.completed_at = utc_now()
+
+                elif remote_status == "FAILED":
+                    transaction.status = (
+                        TransactionStatus.FAILED
+                    )
+
+                else:
+                    transaction.status = (
+                        TransactionStatus.PROCESSING
+                    )
+
+        event = get_webhook_event(
+            session,
+            event_id,
+        )
+
+        if event:
+            event.processed = True
+
+    return {
+        "status": "processed",
+        "event_id": event_id,
+    }
+
+
 @app.get(
     "/v1/investment-opportunities",
     response_model=list[InvestmentOpportunityResponse],
 )
 def list_investment_opportunities(
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[dict]:
     """Return verified investment opportunities as read-only information."""
-
-    # Read the verified opportunities from the database.
-    with connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM investment_opportunities
-            ORDER BY verified_at DESC
-            """
-        ).fetchall()
-
-    # Return only informational investment fields.
-    return [row_dict(row) for row in rows]
+    # Investment opportunities are intentionally not exposed as
+    # executable financial actions in Task B.
+    #
+    # The current origin/main models.py does not define an
+    # InvestmentOpportunity model, so this endpoint is intentionally
+    # left unavailable until the corresponding Alembic model/migration
+    # is added rather than silently creating a second database schema.
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "Investment opportunity storage has not yet been "
+            "added to the SQLAlchemy/Alembic model"
+        ),
+    )

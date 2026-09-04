@@ -1,24 +1,49 @@
-"""BMONI integration boundary.
-
-This module keeps BMONI-specific communication in one place so the rest of
-the application can work with a small, predictable gateway interface.
-"""
+"""BMONI boundary with a deterministic mock and a fail-closed HTTP client."""
 
 import hashlib
 import uuid
+
 from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
 
 import httpx
 
 from app.config import settings
 
 
-class BmoniConfigurationError(RuntimeError):
-    """Raised when the BMONI live integration is missing required configuration."""
+class BmoniError(RuntimeError):
+    """Represent a controlled BMONI integration error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        status_code: int = 502,
+        retryable: bool = False,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+        self.retryable = retryable
 
 
-class BmoniAPIError(RuntimeError):
-    """Raised when the BMONI API rejects a request or returns an invalid response."""
+class BmoniConfigurationError(BmoniError):
+    """Raised when the BMONI integration is missing required configuration."""
+
+    def __init__(self, message: str):
+        super().__init__(
+            message,
+            code="BMONI_NOT_CONFIGURED",
+            status_code=503,
+        )
+
+
+class BmoniConflictError(BmoniError):
+    """Raised when BMONI reports a resource conflict."""
+
+    pass
 
 
 @dataclass
@@ -29,94 +54,185 @@ class BmoniGateway:
     base_url: str = settings.bmoni_base_url
     api_key: str = settings.bmoni_api_key
 
-    # Build the authentication headers required for every BMONI API request.
-    def _headers(self) -> dict:
-        """Return the headers required to authenticate with BMONI."""
-        if not self.api_key:
-            raise BmoniConfigurationError(
-                "BMONI_API_KEY is required when BMONI_MODE=live."
-            )
+    def _live_unconfigured(self, operation: str) -> None:
+        """Raise a configuration error for unsupported live operations."""
+        raise BmoniConfigurationError(
+            f"BMONI operation '{operation}' is not configured for {self.mode} mode"
+        )
 
-        return {
-            "x-api-key": self.api_key,
-            "Content-Type": "application/json",
-        }
-
-    # Send an HTTP request to BMONI and turn vendor errors into application errors.
     def _request(
         self,
         method: str,
         path: str,
         *,
-        json: dict | None = None,
-    ) -> dict:
-        """Send an authenticated request to BMONI."""
-        if not self.base_url:
-            raise BmoniConfigurationError(
-                "BMONI_BASE_URL is required when BMONI_MODE=live."
-            )
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        """Send a request to BMONI and normalize vendor errors."""
+        if self.mode not in {"sandbox", "live"}:
+            self._live_unconfigured(f"{method} {path}")
 
-        url = f"{self.base_url.rstrip('/')}{path}"
+        base_url = settings.bmoni_base_url.rstrip("/")
+
+        if not base_url or not settings.bmoni_api_key:
+            raise BmoniConfigurationError(
+                "BMONI_BASE_URL and BMONI_API_KEY are required outside mock mode"
+            )
 
         try:
             response = httpx.request(
                 method,
-                url,
-                headers=self._headers(),
-                json=json,
-                timeout=20.0,
+                f"{base_url}{path}",
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "x-api-key": settings.bmoni_api_key,
+                },
+                json=json_body,
+                params=params,
+                timeout=10.0,
             )
-        except httpx.RequestError as exc:
-            raise BmoniAPIError(f"Unable to reach BMONI: {exc}") from exc
-
-        if response.is_error:
-            raise BmoniAPIError(
-                f"BMONI returned HTTP {response.status_code}: "
-                f"{response.text[:500]}"
-            )
-
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise BmoniAPIError(
-                "BMONI returned a response that was not valid JSON."
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise BmoniError(
+                "BMONI is temporarily unreachable",
+                code="BMONI_UNAVAILABLE",
+                status_code=503,
+                retryable=True,
             ) from exc
 
-    # Create the BMONI user required before the application can provision a wallet.
+        if response.is_success:
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise BmoniError(
+                    "BMONI returned an invalid response",
+                    code="BMONI_INVALID_RESPONSE",
+                ) from exc
+
+        message = "BMONI rejected the request"
+
+        try:
+            error_body = response.json()
+            candidate = error_body.get("message")
+
+            if isinstance(candidate, list):
+                message = "; ".join(str(item) for item in candidate)
+            elif candidate:
+                message = str(candidate)
+        except ValueError:
+            pass
+
+        if response.status_code == 409:
+            raise BmoniConflictError(
+                message,
+                code="BMONI_CONFLICT",
+                status_code=409,
+            )
+
+        mapped_status = 422 if response.status_code == 400 else 502
+
+        if response.status_code in {401, 403}:
+            mapped_status = 503
+
+        raise BmoniError(
+            message,
+            code=f"BMONI_HTTP_{response.status_code}",
+            status_code=mapped_status,
+            retryable=response.status_code == 429
+            or response.status_code >= 500,
+        )
+
+    def _find_user(
+        self,
+        *,
+        external_id: str,
+        email: str,
+    ) -> dict[str, str] | None:
+        """Find an existing BMONI user after a creation conflict."""
+        page = 1
+
+        while page <= 10:
+            result = self._request(
+                "GET",
+                "/v1/users",
+                params={
+                    "page": page,
+                    "limit": 100,
+                },
+            )
+
+            users = result.get("users", []) if isinstance(result, dict) else []
+
+            for user in users:
+                identity_matches = user.get("identityId") == external_id
+
+                email_matches = (
+                    str(user.get("email", "")).lower() == email.lower()
+                )
+
+                if identity_matches or email_matches:
+                    return {
+                        "id": str(user["bmoniUserId"]),
+                        "status": "ACTIVE",
+                    }
+
+            if len(users) < 100:
+                break
+
+            page += 1
+
+        return None
+
     def create_user(
         self,
         *,
         external_id: str,
         email: str,
-        name: str,
+        first_name: str,
+        last_name: str,
         phone_number: str,
-    ) -> dict:
-        """Create a user in BMONI using the application's registration details."""
-
-        # Keep mock mode available so automated tests can run without
-        # depending on the external BMONI sandbox.
-        if self.mode != "live":
+    ) -> dict[str, str]:
+        """Create the corresponding user in BMONI."""
+        if self.mode == "mock":
             return {
                 "id": f"bm_usr_{uuid.uuid4().hex[:16]}",
                 "status": "ACTIVE",
             }
 
-        # Split the application's display name into the fields BMONI expects.
-        first_name, _, last_name = name.partition(" ")
+        try:
+            result = self._request(
+                "POST",
+                "/v1/users",
+                json_body={
+                    "identityId": external_id,
+                    "firstName": first_name,
+                    "lastName": last_name,
+                    "email": email,
+                    "phoneNumber": phone_number,
+                },
+            )
+        except BmoniConflictError:
+            existing = self._find_user(
+                external_id=external_id,
+                email=email,
+            )
 
-        # Send the required registration information to BMONI.
-        return self._request(
-            "POST",
-            "/v1/users",
-            json={
-                "firstName": first_name,
-                "lastName": last_name or first_name,
-                "email": email,
-                "phoneNumber": phone_number,
-            },
-        )
+            if existing:
+                return existing
 
-    # Provision a managed smart wallet for the BMONI user.
+            raise
+
+        try:
+            return {
+                "id": str(result["user"]["bmoniUserId"]),
+                "status": "ACTIVE",
+            }
+        except (KeyError, TypeError) as exc:
+            raise BmoniError(
+                "BMONI user response is missing bmoniUserId",
+                code="BMONI_INVALID_RESPONSE",
+            ) from exc
+
     def link_wallet(
         self,
         *,
@@ -124,23 +240,159 @@ class BmoniGateway:
         address: str,
         currency: str,
     ) -> dict:
-        """Provision the managed wallet associated with a BMONI user."""
+        """Provide the wallet-linking operation used by the application."""
+        if self.mode != "mock":
+            self._live_unconfigured("owner-proof wallet provisioning")
 
-        # Return a predictable fake wallet when the application is running in mock mode.
-        if self.mode != "live":
+        return {
+            "id": f"bm_wal_{uuid.uuid4().hex[:16]}",
+            "status": "ACTIVE",
+        }
+
+    def create_owner_proof_challenge(
+        self,
+        *,
+        bmoni_user_id: str,
+        owner_address: str,
+        currency: str,
+    ) -> dict:
+        """Create an owner-proof challenge for managed-wallet provisioning."""
+        if self.mode == "mock":
             return {
-                "id": f"bm_wal_{uuid.uuid4().hex[:16]}",
-                "status": "ACTIVE",
+                "challengeId": f"challenge_{uuid.uuid4().hex}",
+                "groupId": f"group_{uuid.uuid4().hex}",
+                "message": f"FlowPilot owner proof for {owner_address}",
+                "expiresAt": "2099-01-01T00:00:00.000Z",
             }
 
-        # BMONI's managed-wallet endpoint provisions the wallet for the user.
         return self._request(
             "POST",
-            f"/v1/users/{bmoni_user_id}/smart-wallets/create-managed",
-            json={},
+            f"/v1/users/{bmoni_user_id}/smart-wallets/owner-proof-challenges",
+            json_body={
+                "currency": currency,
+                "userOwnerAddress": owner_address,
+            },
         )
 
-    # Create a withdrawal proposal used by the existing transaction flow.
+    def list_wallets(
+        self,
+        *,
+        bmoni_user_id: str,
+    ) -> list[dict]:
+        """List managed wallets belonging to a BMONI user."""
+        result = self._request(
+            "GET",
+            f"/v1/users/{bmoni_user_id}/smart-wallets/account/wallets",
+        )
+
+        if not isinstance(result, list):
+            raise BmoniError(
+                "BMONI wallet response is invalid",
+                code="BMONI_INVALID_RESPONSE",
+            )
+
+        return result
+
+    def get_wallet_balances(
+        self,
+        *,
+        bmoni_user_id: str,
+    ) -> dict:
+        """Return authoritative wallet balances from BMONI."""
+        if self.mode == "mock":
+            return {
+                "data": {
+                    "smartAccountAddress": None,
+                    "balances": [
+                        {
+                            "smartWalletId": "mock-cngn-wallet",
+                            "currency": "NGN",
+                            "balance": "300000.00",
+                            "error": None,
+                        }
+                    ],
+                }
+            }
+
+        result = self._request(
+            "GET",
+            f"/v1/users/{bmoni_user_id}/smart-wallets/account/balances",
+        )
+
+        if not isinstance(result, dict) or not isinstance(
+            result.get("data"),
+            dict,
+        ):
+            raise BmoniError(
+                "BMONI balance response is invalid",
+                code="BMONI_INVALID_RESPONSE",
+            )
+
+        return result
+
+    def create_managed_wallet(
+        self,
+        *,
+        bmoni_user_id: str,
+        owner_address: str,
+        currency: str,
+        challenge_id: str,
+        signature: str,
+    ) -> dict:
+        """Create a managed wallet after owner-proof verification."""
+        if self.mode == "mock":
+            return {
+                "id": f"bm_wal_{uuid.uuid4().hex[:16]}",
+                "currency": currency,
+                "walletAddress": owner_address,
+                "isActive": True,
+            }
+
+        existing = next(
+            (
+                wallet
+                for wallet in self.list_wallets(
+                    bmoni_user_id=bmoni_user_id
+                )
+                if wallet.get("currency") == currency
+            ),
+            None,
+        )
+
+        if existing:
+            return existing
+
+        try:
+            return self._request(
+                "POST",
+                f"/v1/users/{bmoni_user_id}/smart-wallets/create-managed",
+                json_body={
+                    "currency": currency,
+                    "userOwnerAddress": owner_address,
+                    "ownerProofChallengeId": challenge_id,
+                    "ownerProofSignature": signature,
+                },
+            )
+        except BmoniError as exc:
+            if not exc.retryable:
+                raise
+
+            recovered = next(
+                (
+                    wallet
+                    for wallet in self.list_wallets(
+                        bmoni_user_id=bmoni_user_id
+                    )
+                    if wallet.get("currency") == currency
+                ),
+                None,
+            )
+
+            if recovered:
+                return recovered
+
+            raise
+
     def create_withdrawal_proposal(
         self,
         *,
@@ -149,134 +401,242 @@ class BmoniGateway:
         currency: str,
         recipient_name: str,
     ) -> dict:
-        """Create a withdrawal proposal for a BMONI smart wallet."""
+        """Create a withdrawal proposal used by the transaction flow."""
+        if self.mode != "mock":
+            self._live_unconfigured("create_withdrawal_proposal")
 
-        # Preserve the existing deterministic application behavior in mock mode.
-        if self.mode != "live":
-            return {
-                "id": f"bm_prp_{uuid.uuid4().hex[:16]}",
-                "status": "PENDING_SIGNATURES",
-            }
+        return {
+            "id": f"bm_prp_{uuid.uuid4().hex[:16]}",
+            "status": "PENDING_SIGNATURES",
+        }
 
-        # The exact withdrawal proposal payload still needs to be matched
-        # against the team's confirmed BMONI transaction schema.
-        raise BmoniConfigurationError(
-            "Live withdrawal proposal schema has not been confirmed."
-        )
-
-    # Return the signing payload associated with a transaction proposal.
-    def get_signing_payload(
+    def get_fx_quote(
         self,
         *,
+        bmoni_user_id: str,
+        amount_decimal: str,
+        source: str,
+        target: str,
+    ) -> dict:
+        """Request a currency-exchange quote from BMONI."""
+        if self.mode != "mock":
+            return self._request(
+                "POST",
+                f"/v1/users/{bmoni_user_id}/exchange/quote",
+                json_body={
+                    "swapAmount": {
+                        "type": "exactIn",
+                        "amountIn": amount_decimal,
+                    },
+                    "fromCurrency": source,
+                    "toCurrency": target,
+                },
+            )
+
+        amount_out = Decimal(amount_decimal) / Decimal(1600)
+
+        return {
+            "quoteId": f"bm_qte_{uuid.uuid4().hex[:16]}",
+            "fromCurrency": source,
+            "toCurrency": target,
+            "amountIn": amount_decimal,
+            "amountOut": f"{amount_out:.2f}",
+            "exchangeRate": "0.000625",
+            "toUsdExchangeRate": "0.000625",
+            "fees": [],
+            "quotedAt": "2099-01-01T00:00:00.000Z",
+            "expiresAt": "2099-01-01T00:01:00.000Z",
+            "expiresInSeconds": 60,
+        }
+
+    @staticmethod
+    def _proposal(
+        result: dict,
+        operation: str,
+    ) -> dict:
+        """Extract and validate a proposal from a BMONI response."""
+        try:
+            proposal = result["data"]["proposal"]
+
+            if not proposal.get("id") or not proposal.get("status"):
+                raise KeyError
+        except (KeyError, TypeError) as exc:
+            raise BmoniError(
+                f"BMONI {operation} response is invalid",
+                code="BMONI_INVALID_RESPONSE",
+            ) from exc
+
+        return proposal
+
+    def create_swap_proposal(
+        self,
+        *,
+        bmoni_user_id: str,
+        smart_wallet_id: str,
+        amount_decimal: str,
+        from_stablecoin: str = "CNGN",
+        to_stablecoin: str = "USDB",
+        slippage_bps: int = 50,
+    ) -> dict:
+        """Create a BMONI swap proposal without executing the swap."""
+        if self.mode == "mock":
+            return {
+                "data": {
+                    "proposal": {
+                        "id": f"bm_prp_{uuid.uuid4().hex[:16]}",
+                        "status": "PENDING_APPROVALS",
+                    }
+                }
+            }
+
+        result = self._request(
+            "POST",
+            f"/v1/users/{bmoni_user_id}/smart-wallets/{smart_wallet_id}/proposals",
+            json_body={
+                "proposal": {
+                    "type": "SWAP",
+                    "fromStablecoin": from_stablecoin,
+                    "toStablecoin": to_stablecoin,
+                    "fromAmount": amount_decimal,
+                    "slippageBps": slippage_bps,
+                    "description": "FlowPilot Currency Shield conversion",
+                }
+            },
+        )
+
+        self._proposal(result, "proposal creation")
+
+        return result
+
+    def approve_proposal(
+        self,
+        *,
+        bmoni_user_id: str,
         proposal_id: str,
     ) -> dict:
-        """Retrieve the payload that the application must sign."""
+        """Approve a BMONI swap proposal for signing."""
+        if self.mode == "mock":
+            return {
+                "data": {
+                    "proposal": {
+                        "id": proposal_id,
+                        "status": "PENDING_SIGNATURES",
+                    }
+                }
+            }
 
-        # Use the existing deterministic fixture during local testing.
-        if self.mode != "live":
+        result = self._request(
+            "POST",
+            f"/v1/users/{bmoni_user_id}/smart-wallets/proposals/{proposal_id}/approve",
+        )
+
+        self._proposal(result, "proposal approval")
+
+        return result
+
+    def get_proposal(
+        self,
+        *,
+        bmoni_user_id: str,
+        proposal_id: str,
+    ) -> dict:
+        """Retrieve the current state of a BMONI proposal."""
+        if self.mode == "mock":
+            return {
+                "data": {
+                    "proposal": {
+                        "id": proposal_id,
+                        "status": "PENDING_SIGNATURES",
+                    }
+                }
+            }
+
+        result = self._request(
+            "GET",
+            f"/v1/users/{bmoni_user_id}/smart-wallets/proposals/{proposal_id}",
+        )
+
+        self._proposal(result, "proposal lookup")
+
+        return result
+
+    def get_proposal_signing_payload(
+        self,
+        *,
+        bmoni_user_id: str,
+        proposal_id: str,
+    ) -> dict:
+        """Retrieve the signing payload required for a BMONI proposal."""
+        if self.mode == "mock":
             digest = hashlib.sha256(proposal_id.encode()).hexdigest()
 
             return {
-                "proposal_id": proposal_id,
-                "hash": f"0x{digest}",
-                "algorithm": "ECDSA",
+                "data": {
+                    "method": "eth_sign",
+                    "walletIndex": 0,
+                    "workflowId": f"wf_{proposal_id}",
+                    "proposalId": proposal_id,
+                    "hashToSign": f"0x{digest}",
+                    "payload": {},
+                    "deadline": 4102444800,
+                }
             }
 
-        # The live BMONI signing endpoint requires a user ID, which the
-        # current gateway method does not receive yet.
-        raise BmoniConfigurationError(
-            "Live signing payload integration requires the confirmed BMONI user context."
+        result = self._request(
+            "GET",
+            f"/v1/users/{bmoni_user_id}/smart-wallets/proposals/{proposal_id}/sign-payload",
         )
 
-    # Submit a transaction signature in mock mode while keeping the live
-    # implementation deliberately disabled until its exact schema is wired.
-    def submit_signature(
+        data = result.get("data") if isinstance(result, dict) else None
+
+        required = {
+            "method",
+            "walletIndex",
+            "workflowId",
+            "hashToSign",
+            "payload",
+            "deadline",
+        }
+
+        if not isinstance(data, dict) or not required.issubset(data):
+            raise BmoniError(
+                "BMONI signing payload is invalid",
+                code="BMONI_INVALID_RESPONSE",
+            )
+
+        return result
+
+    def submit_proposal_signature(
         self,
         *,
+        bmoni_user_id: str,
         proposal_id: str,
         signature: str,
     ) -> dict:
         """Submit a signature for a BMONI proposal."""
-
-        # Validate the signature before accepting it in mock mode.
-        if self.mode != "live":
-            if not signature.startswith("0x") or len(signature) < 10:
-                raise ValueError(
-                    "Signature must be a non-empty hexadecimal value"
-                )
-
+        if self.mode == "mock":
             return {
-                "id": proposal_id,
-                "status": "COMPLETED",
+                "data": {
+                    "proposal": {
+                        "id": proposal_id,
+                        "status": "COMPLETED",
+                    }
+                }
             }
 
-        raise BmoniConfigurationError(
-            "Live signature submission schema has not been confirmed."
-        )
-
-    # Request an exchange quote from BMONI for Currency Shield.
-    def get_fx_quote(
-        self,
-        *,
-        user_id: str,
-        amount_minor: int,
-        source: str,
-        target: str,
-    ) -> dict:
-        """Create a currency-exchange quote for the requested amount."""
-
-        # Use a deterministic fixture for the existing automated demo flow.
-        if self.mode != "live":
-            return {
-                "id": f"bm_qte_{uuid.uuid4().hex[:16]}",
-                "source": source,
-                "target": target,
-                "source_amount_minor": amount_minor,
-                "target_amount_minor": amount_minor // 1600,
-                "rate": "1600.00",
-                "fee_minor": 0,
-                "expires_in_seconds": 60,
-            }
-
-        # Use BMONI's documented user-level exchange quote endpoint.
-        return self._request(
+        result = self._request(
             "POST",
-            f"/v1/users/{user_id}/exchange/quote",
-            json={
-                "sourceCurrency": source,
-                "targetCurrency": target,
-                "amount": str(amount_minor),
+            f"/v1/users/{bmoni_user_id}/smart-wallets/proposals/{proposal_id}/sign",
+            json_body={
+                "signature": signature,
             },
         )
 
-    # Execute a previously created Currency Shield exchange.
-    def execute_fx_conversion(
-        self,
-        *,
-        user_id: str,
-        quote_id: str,
-        idempotency_key: str,
-    ) -> dict:
-        """Execute a previously generated BMONI exchange quote."""
+        self._proposal(result, "signature submission")
 
-        # Return a completed fixture during mock-mode tests.
-        if self.mode != "live":
-            return {
-                "id": f"bm_fx_{uuid.uuid4().hex[:16]}",
-                "status": "COMPLETED",
-                "quote_id": quote_id,
-            }
-
-        # Execute the conversion through BMONI's exchange endpoint.
-        return self._request(
-            "POST",
-            f"/v1/users/{user_id}/exchange/convert",
-            json={
-                "quoteId": quote_id,
-                "idempotencyKey": idempotency_key,
-            },
-        )
+        return result
 
 
 # Create one gateway instance that the FastAPI application can reuse.
 bmoni = BmoniGateway()
+
