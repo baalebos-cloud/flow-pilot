@@ -59,7 +59,11 @@ def model_dict(item) -> dict:
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> User:
     if not credentials:
-        raise HTTPException(status_code=401, detail="Authentication required")
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+        )
+
     try:
         user_id = decode_access_token(credentials.credentials)
     except InvalidTokenError:
@@ -88,7 +92,10 @@ async def bmoni_error(_: Request, exc: BmoniError):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "bmoni_mode": settings.bmoni_mode}
+    return {
+        "status": "ok",
+        "bmoni_mode": settings.bmoni_mode,
+    }
 
 
 @app.post("/v1/auth/register", status_code=201)
@@ -193,6 +200,7 @@ def create_owner_proof_challenge(
     payload: OwnerProofChallengeRequest, user: User = Depends(current_user)
 ) -> dict:
     currency = payload.currency.upper()
+
     if currency != "CNGN":
         raise HTTPException(status_code=422, detail="The MVP currently supports CNGN only")
     if not user.bmoni_user_id:
@@ -347,10 +355,13 @@ def create_action_plan(payload: ActionPlanRequest, user: User = Depends(current_
     currency, failures = payload.currency.upper(), []
     if currency != "CNGN":
         failures.append("UNSUPPORTED_CURRENCY")
+
     if payload.amount_minor > payload.available_balance_minor:
         failures.append("INSUFFICIENT_BALANCE")
+
     if payload.amount_minor > settings.max_transaction_minor:
         failures.append("PER_TRANSACTION_LIMIT_EXCEEDED")
+
     if failures:
         raise HTTPException(status_code=422, detail={"risk_status": "REJECTED", "reasons": failures})
     plan_id, expected = new_id("plan"), payload.available_balance_minor - payload.amount_minor
@@ -454,6 +465,17 @@ def owned_transaction(transaction_id: str, user_id: str) -> Transaction:
 def read_transaction(transaction_id: str, user: User = Depends(current_user)) -> dict:
     return model_dict(owned_transaction(transaction_id, user.id))
 
+@app.get(
+    "/v1/transactions/{transaction_id}/signing-payload"
+)
+def signing_payload(
+    transaction_id: str,
+    user: dict = Depends(current_user),
+) -> dict:
+    transaction = owned_transaction(
+        transaction_id,
+        user["id"],
+    )
 
 @app.get("/v1/transactions/{transaction_id}/signing-payload")
 def signing_payload(transaction_id: str, user: User = Depends(current_user)) -> dict:
@@ -462,6 +484,9 @@ def signing_payload(transaction_id: str, user: User = Depends(current_user)) -> 
         raise HTTPException(status_code=409, detail="Transaction is not awaiting a signature")
     return bmoni.get_signing_payload(proposal_id=item.bmoni_proposal_id)
 
+    return bmoni.get_signing_payload(
+        proposal_id=transaction["bmoni_proposal_id"]
+    )
 
 @app.post("/v1/transactions/{transaction_id}/signature")
 def submit_signature(transaction_id: str, payload: SignatureRequest,
@@ -504,6 +529,7 @@ async def bmoni_webhook(
     x_source_event_id: str | None = Header(default=None),
 ) -> dict:
     raw = await request.body()
+
     if settings.bmoni_webhook_secret:
         expected = hmac.new(
             settings.bmoni_webhook_secret.encode(), raw, hashlib.sha256
@@ -513,7 +539,11 @@ async def bmoni_webhook(
         ):
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
     elif settings.environment != "development":
-        raise HTTPException(status_code=503, detail="Webhook secret is not configured")
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook secret is not configured",
+        )
+
     try:
         event = json.loads(raw)
         event_id, event_type = str(event["id"]), str(event["eventType"])
@@ -555,9 +585,15 @@ async def bmoni_webhook(
 @app.post("/v1/pockets", status_code=201)
 def create_pocket(payload: PocketCreateRequest, user: User = Depends(current_user)) -> dict:
     currency = payload.currency.upper()
+
     if currency not in {"CNGN", "USD"}:
-        raise HTTPException(status_code=422, detail="Unsupported pocket currency")
+        raise HTTPException(
+            status_code=422,
+            detail="Unsupported pocket currency",
+        )
+
     pocket_id = new_id("pkt")
+
     try:
         with session_scope() as session:
             session.add(Pocket(id=pocket_id, user_id=user.id, name=payload.name,
@@ -610,6 +646,14 @@ def create_currency_shield(payload: CurrencyShieldRequest,
     return {"id": recommendation_id, "status": "AWAITING_APPROVAL", "rationale": rationale,
             "risk_disclosure": disclosure, "evidence": evidence, "requires_user_approval": True}
 
+    return {
+        "id": recommendation_id,
+        "status": "AWAITING_APPROVAL",
+        "rationale": rationale,
+        "risk_disclosure": disclosure,
+        "evidence": evidence,
+        "requires_user_approval": True,
+    }
 
 @app.post("/v1/recommendations/{recommendation_id}/approve", status_code=201)
 def approve_currency_shield(recommendation_id: str,
