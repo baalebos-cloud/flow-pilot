@@ -1,92 +1,41 @@
-import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
-import '../features/dashboard/dashboard_screen.dart';
-import '../features/activity/activity_screen.dart';
-import '../features/assistant/assistant_screen.dart';
-import '../features/planning/plan_screen.dart';
-import '../features/review/explanation_screen.dart';
-import '../features/review/review_screen.dart';
-import '../features/approval/approval_screen.dart';
-import '../features/transaction/signing_screen.dart';
-import '../features/transaction/processing_screen.dart';
-import '../features/transaction/success_screen.dart';
-import '../features/transaction/transaction_detail_screen.dart';
-import '../features/wallet/wallet_screen.dart';
-import '../features/profile/profile_screen.dart';
+import '../features/auth/login_screen.dart';
+import '../features/auth/register_screen.dart';
+import '../features/auth/splash_screen.dart';
+import '../features/currency_shield/currency_shield_screen.dart';
+import '../features/pockets/create_pocket_screen.dart';
+import '../features/pockets/pockets_screen.dart';
+import '../features/wallet/wallet_link_screen.dart';
 
+/// Scope note: this router only wires the screens the FlowPilot handoff
+/// doc calls for (auth, wallet linking, pockets, Currency Shield). The
+/// original hackathon-flow screens (dashboard/activity/assistant/planning/
+/// approval) were removed here because they import providers/models/
+/// services/mock folders that don't exist in this repo and represent
+/// features (wallet balances, transaction history, AI goal flow) the
+/// handoff doc explicitly says not to build for this demo. Re-add them
+/// once their supporting layer is actually implemented.
 final GoRouter appRouter = GoRouter(
-  initialLocation: '/home',
+  initialLocation: '/splash',
   routes: [
+    GoRoute(path: '/splash', builder: (context, state) => const SplashScreen()),
+    GoRoute(path: '/login', builder: (context, state) => const LoginScreen()),
+    GoRoute(path: '/register', builder: (context, state) => const RegisterScreen()),
+    GoRoute(path: '/wallet-setup', builder: (context, state) => const WalletLinkScreen()),
     GoRoute(
-      path: '/home',
-      builder: (context, state) => const DashboardScreen(),
+      path: '/pockets',
+      builder: (context, state) => const PocketsScreen(),
+      routes: [
+        GoRoute(
+          path: 'create',
+          builder: (context, state) => const CreatePocketScreen(),
+        ),
+      ],
     ),
-
-    GoRoute(
-      path: '/activity',
-      builder: (context, state) => const ActivityScreen(),
-    ),
-
-    GoRoute(
-      path: '/assistant',
-      builder: (context, state) => const AssistantScreen(),
-    ),
-
-    GoRoute(
-      path: '/planning',
-      builder: (context, state) => const PlanScreen(),
-    ),
-
-    GoRoute(
-      path: '/explanation',
-      builder: (context, state) => const ExplanationScreen(),
-    ),
-
-    GoRoute(
-      path: '/review',
-      builder: (context, state) => const ReviewScreen(),
-    ),
-
-    GoRoute(
-      path: '/approval',
-      builder: (context, state) => const ApprovalScreen(),
-    ),
-
-    GoRoute(
-      path: '/signing',
-      builder: (context, state) => const SigningScreen(),
-    ),
-
-    GoRoute(
-      path: '/processing',
-      builder: (context, state) => const ProcessingScreen(),
-    ),
-
-    GoRoute(
-      path: '/success',
-      builder: (context, state) => const SuccessScreen(),
-    ),
-
-    GoRoute(
-      path: '/transaction/:id',
-      builder: (context, state) {
-        final id = state.pathParameters['id'] ?? '';
-
-        return TransactionDetailScreen(
-          id: id,
-        );
-      },
-    ),
-
-    GoRoute(
-      path: '/wallet',
-      builder: (context, state) => const WalletScreen(),
-    ),
-
-    GoRoute(
-      path: '/profile',
-      builder: (context, state) => const ProfileScreen(),
-    ),
+    GoRoute(path: '/currency-shield', builder: (context, state) => const CurrencyShieldScreen()),
+    // '/home' is used as the post-login landing route; point it at pockets
+    // for now since there's no dashboard screen in scope yet.
+    GoRoute(path: '/home', redirect: (context, state) => '/pockets'),
   ],
 );
