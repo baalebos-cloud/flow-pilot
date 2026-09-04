@@ -18,7 +18,13 @@ def test_complete_demo_flow(tmp_path: Path, monkeypatch):
     with TestClient(app) as client:
         registration = client.post(
             "/v1/auth/register",
-            json={"email": "sarah@example.com", "name": "Sarah", "password": "strong-password"},
+            json={
+                "email": "sarah@example.com",
+                "first_name": "Sarah",
+                "last_name": "Johnson",
+                "password": "strong-password",
+                "phone_number": "+2348012345678",
+            },
         )
         assert registration.status_code == 201
         body = registration.json()
