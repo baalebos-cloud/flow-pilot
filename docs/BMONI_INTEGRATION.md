@@ -37,6 +37,16 @@ Before creating, FlowPilot lists the user's BMONI wallets and reuses an
 existing wallet for the requested currency. It repeats that read after an
 ambiguous retryable failure, preventing blind duplicate wallet creation.
 
+## Authoritative balances
+
+`GET /v1/wallets/balances` reads BMONI's account-level balances and converts
+decimal strings to integer minor units using `Decimal`, never binary floating
+point. BMONI's `NGN` balance label is normalized to FlowPilot's `CNGN`.
+
+An upstream per-currency read failure is represented as unavailable, not as a
+zero balance. Internal allocation policies can call `available_balance_minor`
+and fail closed when the authoritative balance cannot be read.
+
 ## Intentionally blocked outside mock mode
 
 - A bank withdrawal uses the Nigerian beneficiary/offramp sequence.

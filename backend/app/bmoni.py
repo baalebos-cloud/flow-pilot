@@ -189,6 +189,30 @@ class BmoniGateway:
             )
         return result
 
+    def get_wallet_balances(self, *, bmoni_user_id: str) -> dict:
+        if self.mode == "mock":
+            return {
+                "data": {
+                    "smartAccountAddress": None,
+                    "balances": [
+                        {
+                            "smartWalletId": "mock-cngn-wallet",
+                            "currency": "NGN",
+                            "balance": "300000.00",
+                            "error": None,
+                        }
+                    ],
+                }
+            }
+        result = self._request(
+            "GET", f"/v1/users/{bmoni_user_id}/smart-wallets/account/balances"
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("data"), dict):
+            raise BmoniError(
+                "BMONI balance response is invalid", code="BMONI_INVALID_RESPONSE"
+            )
+        return result
+
     def create_managed_wallet(
         self,
         *,
