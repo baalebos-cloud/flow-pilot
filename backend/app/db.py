@@ -122,6 +122,18 @@ def init_db() -> None:
               completed_at TEXT,
               UNIQUE(user_id, idempotency_key)
             );
+            CREATE TABLE IF NOT EXISTS investment_opportunities (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              regulatory_status TEXT NOT NULL,
+              risk_level TEXT NOT NULL,
+              liquidity TEXT NOT NULL,
+              fee_minor INTEGER NOT NULL DEFAULT 0,
+              currency TEXT NOT NULL,
+              description TEXT NOT NULL,
+              verified_at TEXT NOT NULL
+            );
             """
         )
 

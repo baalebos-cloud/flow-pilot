@@ -2,10 +2,12 @@ from pydantic import BaseModel, EmailStr, Field
 
 
 class RegisterRequest(BaseModel):
+    """Validate the information required to create a FlowPilot user."""
+
     email: EmailStr
     name: str = Field(min_length=2, max_length=100)
     password: str = Field(min_length=8, max_length=128)
-
+    phone_number: str = Field(min_length=10, max_length=20)
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -36,6 +38,42 @@ class PocketCreateRequest(BaseModel):
     currency: str = "CNGN"
     protected: bool = False
 
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "name": "Emergency Fund",
+                "purpose": "Emergency savings",
+                "allocated_minor": 5_000_000,
+                "currency": "CNGN",
+                "protected": True,
+            }
+        }
+    }
+
+# Validate the information required to transfer allocated funds between pockets.
+class PocketTransferRequest(BaseModel):
+    """Validate a transfer between two pockets owned by the same user."""
+
+    source_pocket_id: str
+    destination_pocket_id: str
+    amount_minor: int = Field(gt=0)
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "source_pocket_id": "pocket_emergency",
+                "destination_pocket_id": "pocket_rent",
+                "amount_minor": 1_000_000,
+            }
+        }
+    }
+
+
+# Validate a transaction category supplied by the authenticated user.
+class TransactionCategorizeRequest(BaseModel):
+    """Validate the category assigned to a transaction."""
+
+    category: str = Field(min_length=2, max_length=60)
 
 class CurrencyShieldRequest(BaseModel):
     pocket_id: str
@@ -43,3 +81,30 @@ class CurrencyShieldRequest(BaseModel):
     amount_minor: int = Field(gt=0)
     observed_change_bps: int
     observation_window_days: int = Field(ge=1, le=365)
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "pocket_id": "pocket_travel",
+                "target_currency": "USD",
+                "amount_minor": 1_000_000,
+                "observed_change_bps": -600,
+                "observation_window_days": 30,
+            }
+        }
+    }
+
+# Represent a verified investment opportunity exposed as read-only information.
+class InvestmentOpportunityResponse(BaseModel):
+    """Describe an investment opportunity without providing execution controls."""
+
+    id: str
+    name: str
+    provider: str
+    regulatory_status: str
+    risk_level: str
+    liquidity: str
+    fee_minor: int
+    currency: str
+    description: str
+    verified_at: str
