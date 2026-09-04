@@ -1,7 +1,7 @@
+import 'package:bkey_uikit/bkey_uikit.dart';
 import 'package:flutter/material.dart';
 
 import 'router.dart';
-import 'theme/app_theme.dart';
 
 class FlowPilotApp extends StatelessWidget {
   const FlowPilotApp({super.key});
@@ -11,7 +11,7 @@ class FlowPilotApp extends StatelessWidget {
     return MaterialApp.router(
       debugShowCheckedModeBanner: false,
       title: 'FlowPilot × BMONI',
-      theme: buildAppTheme(),
+      theme: BMoniTheme.darkTheme(),
       routerConfig: appRouter,
     );
   }
