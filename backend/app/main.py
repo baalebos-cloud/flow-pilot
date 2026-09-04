@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.ai.router import build_ai_router
+from app.auth import get_current_user
 from app.bmoni import BmoniError, bmoni
 from app.balances import (
     available_balance_minor,
@@ -125,7 +126,7 @@ app = FastAPI(
 )
 
 
-app.include_router(build_ai_router())
+app.include_router(build_ai_router(get_current_user))
 
 
 security = HTTPBearer()
