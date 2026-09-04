@@ -266,3 +266,61 @@ def test_proposal_approval_uses_verified_sandbox_route(monkeypatch):
         "/v1/users/user-1/smart-wallets/proposals/proposal-1/approve"
     )
     assert captured["json"] is None
+
+
+def test_swap_proposal_uses_bmoni_contract(monkeypatch):
+    monkeypatch.setattr(config.settings, "bmoni_base_url", "https://embedded-dev.bmoni.com")
+    monkeypatch.setattr(config.settings, "bmoni_api_key", "test-key")
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return response(201, {"data": {"proposal": {
+            "id": "proposal-1", "status": "PENDING_APPROVALS"
+        }}})
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    BmoniGateway(mode="sandbox").create_swap_proposal(
+        bmoni_user_id="user-1", smart_wallet_id="wallet-1",
+        amount_decimal="1000.00",
+    )
+
+    assert captured["url"].endswith(
+        "/v1/users/user-1/smart-wallets/wallet-1/proposals"
+    )
+    assert captured["json"]["proposal"] == {
+        "type": "SWAP", "fromStablecoin": "CNGN", "toStablecoin": "USDB",
+        "fromAmount": "1000.00", "slippageBps": 50,
+        "description": "FlowPilot Currency Shield conversion",
+    }
+
+
+def test_signing_payload_and_signature_use_proposal_routes(monkeypatch):
+    monkeypatch.setattr(config.settings, "bmoni_base_url", "https://embedded-dev.bmoni.com")
+    monkeypatch.setattr(config.settings, "bmoni_api_key", "test-key")
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs.get("json")))
+        if method == "GET":
+            return response(200, {"data": {
+                "method": "eth_sign", "walletIndex": 0, "workflowId": "wf-1",
+                "hashToSign": "0x" + "a" * 64, "payload": {}, "deadline": 123,
+            }})
+        return response(200, {"data": {"proposal": {
+            "id": "proposal-1", "status": "COMPLETED"
+        }}})
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    gateway = BmoniGateway(mode="sandbox")
+    gateway.get_proposal_signing_payload(
+        bmoni_user_id="user-1", proposal_id="proposal-1"
+    )
+    gateway.submit_proposal_signature(
+        bmoni_user_id="user-1", proposal_id="proposal-1",
+        signature="0x" + "b" * 130,
+    )
+
+    assert calls[0][1].endswith("/proposals/proposal-1/sign-payload")
+    assert calls[1][1].endswith("/proposals/proposal-1/sign")
+    assert calls[1][2] == {"signature": "0x" + "b" * 130}

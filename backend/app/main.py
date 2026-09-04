@@ -16,7 +16,7 @@ from app.config import settings
 from app.database import session_scope
 from app.models import ActionPlan, FxConversion, Pocket, Recommendation, Transaction, User, Wallet, WebhookEvent
 from app.repositories import (
-    add_audit, get_action_plan, get_fx_by_idempotency, get_pocket,
+    add_audit, get_action_plan, get_fx_by_idempotency, get_fx_conversion, get_pocket,
     get_recommendation, get_transaction, get_transaction_by_idempotency,
     get_transaction_by_proposal, get_user_by_email, get_user_by_id,
     get_wallet_by_user, get_webhook_event, list_user_pockets, utc_now,
@@ -26,7 +26,7 @@ from app.schemas import (
     ActionPlanRequest, CurrencyShieldRequest, FxQuoteRequest, LoginRequest,
     PocketCreateRequest,
     ManagedWalletCreateRequest, OwnerProofChallengeRequest, RegisterRequest,
-    SignatureRequest, WalletLinkRequest,
+    ProposalSignatureRequest, SignatureRequest, WalletLinkRequest,
 )
 from app.security import create_access_token, decode_access_token, hash_password, verify_password
 from app.workflow import (
@@ -625,7 +625,12 @@ def approve_currency_shield(recommendation_id: str,
     with session_scope() as session:
         existing = get_fx_by_idempotency(session, user.id, idempotency_key)
         if existing:
-            return model_dict(existing)
+            return {"id": existing.id, "bmoni_proposal_id": existing.bmoni_conversion_id,
+                    "status": existing.status, "quote": json.loads(existing.quote_json),
+                    "money_has_moved": existing.status == "COMPLETED"}
+        wallet = get_wallet_by_user(session, user.id)
+        if not wallet or not wallet.bmoni_wallet_id or not user.bmoni_user_id:
+            raise HTTPException(status_code=409, detail="A managed BMONI wallet is required")
         recommendation = session.scalar(select(Recommendation).where(
             Recommendation.id == recommendation_id, Recommendation.user_id == user.id).with_for_update())
         if not recommendation:
@@ -638,25 +643,44 @@ def approve_currency_shield(recommendation_id: str,
             RECOMMENDATION_TRANSITIONS,
         )
         snapshot = (recommendation.amount_minor, recommendation.source_currency,
-                    recommendation.target_currency)
+                    recommendation.target_currency, user.bmoni_user_id, wallet.bmoni_wallet_id)
     if snapshot[0] is None or snapshot[1] is None or snapshot[2] is None:
         raise HTTPException(status_code=409, detail="Recommendation is incomplete")
     try:
+        balance = available_balance_minor(
+            bmoni, bmoni_user_id=snapshot[3], currency=snapshot[1]
+        )
+        if snapshot[0] > balance:
+            raise HTTPException(status_code=422, detail="Insufficient authoritative wallet balance")
         quote = bmoni.get_fx_quote(
-            bmoni_user_id=user.bmoni_user_id or "",
+            bmoni_user_id=snapshot[3],
             amount_decimal=minor_to_decimal(snapshot[0], "NGN"),
             source="NGN",
             target=snapshot[2],
         )
-        remote = bmoni.execute_fx_conversion(
-            quote_id=quote["quoteId"], idempotency_key=idempotency_key
+        created = bmoni.create_swap_proposal(
+            bmoni_user_id=snapshot[3], smart_wallet_id=snapshot[4],
+            amount_decimal=minor_to_decimal(snapshot[0], snapshot[1]),
+            from_stablecoin=snapshot[1],
+            to_stablecoin="USDB" if snapshot[2] == "USD" else snapshot[2],
         )
-    except Exception:
+        proposal_id = created["data"]["proposal"]["id"]
+        approved = bmoni.approve_proposal(
+            bmoni_user_id=snapshot[3], proposal_id=proposal_id
+        )
+        remote_status = approved["data"]["proposal"]["status"]
+        if remote_status != "PENDING_SIGNATURES":
+            raise BmoniError(
+                "BMONI proposal is not ready for signing",
+                code="BMONI_UNEXPECTED_PROPOSAL_STATUS",
+            )
+    except Exception as exc:
+        ambiguous = isinstance(exc, BmoniError) and exc.retryable
         with session_scope() as session:
             failed_recommendation = get_recommendation(
                 session, recommendation_id, user.id
             )
-            if (
+            if (not ambiguous and
                 failed_recommendation
                 and failed_recommendation.status == RecommendationStatus.EXECUTING
             ):
@@ -680,19 +704,97 @@ def approve_currency_shield(recommendation_id: str,
         recommendation = get_recommendation(session, recommendation_id, user.id)
         if not recommendation:
             raise HTTPException(status_code=404, detail="Recommendation not found")
-        recommendation.status = transition(
-            recommendation.status,
-            RecommendationStatus.EXECUTED,
-            RECOMMENDATION_TRANSITIONS,
-        )
         session.add(FxConversion(id=conversion_id, user_id=user.id,
                                  recommendation_id=recommendation_id,
-                                 bmoni_conversion_id=remote["id"], status=remote["status"],
+                                 bmoni_conversion_id=proposal_id, status="PENDING_SIGNATURE",
                                  source_amount_minor=snapshot[0], source_currency=snapshot[1],
                                  target_currency=snapshot[2], quote_json=json.dumps(quote),
                                  idempotency_key=idempotency_key, created_at=utc_now(),
-                                 completed_at=utc_now() if remote["status"] == "COMPLETED" else None))
+                                 completed_at=None))
         add_audit(session, event_id=new_id("aud"), actor_user_id=user.id,
                   action="FX_CONVERSION_APPROVE", resource_type="FX_CONVERSION",
-                  resource_id=conversion_id, outcome="SUCCEEDED")
-    return {"id": conversion_id, "status": remote["status"], "quote": quote}
+                  resource_id=conversion_id, outcome="PENDING_SIGNATURE")
+    return {"id": conversion_id, "bmoni_proposal_id": proposal_id,
+            "status": "PENDING_SIGNATURE", "quote": quote, "money_has_moved": False}
+
+
+def _reconcile_fx(conversion: FxConversion, recommendation: Recommendation, remote: dict) -> None:
+    remote_status = remote["data"]["proposal"]["status"]
+    status_map = {
+        "PENDING_APPROVALS": "PROCESSING", "PENDING_SIGNATURES": "PENDING_SIGNATURE",
+        "COMPLETED": "COMPLETED", "FAILED": "FAILED",
+    }
+    conversion.status = status_map.get(remote_status, "PROCESSING")
+    if conversion.status == "COMPLETED" and recommendation.status == RecommendationStatus.EXECUTING:
+        recommendation.status = transition(
+            recommendation.status, RecommendationStatus.EXECUTED, RECOMMENDATION_TRANSITIONS
+        )
+        conversion.completed_at = utc_now()
+    elif conversion.status == "FAILED" and recommendation.status == RecommendationStatus.EXECUTING:
+        recommendation.status = transition(
+            recommendation.status, RecommendationStatus.FAILED, RECOMMENDATION_TRANSITIONS
+        )
+
+
+@app.get("/v1/fx/conversions/{conversion_id}")
+def get_currency_shield_conversion(conversion_id: str,
+                                   user: User = Depends(current_user)) -> dict:
+    with session_scope() as session:
+        conversion = get_fx_conversion(session, conversion_id, user.id)
+        if not conversion:
+            raise HTTPException(status_code=404, detail="Conversion not found")
+        recommendation = get_recommendation(session, conversion.recommendation_id, user.id)
+        remote = bmoni.get_proposal(
+            bmoni_user_id=user.bmoni_user_id or "", proposal_id=conversion.bmoni_conversion_id
+        )
+        _reconcile_fx(conversion, recommendation, remote)
+        result = {"id": conversion.id, "bmoni_proposal_id": conversion.bmoni_conversion_id,
+                  "status": conversion.status,
+                  "money_has_moved": conversion.status == "COMPLETED"}
+    return result
+
+
+@app.get("/v1/fx/conversions/{conversion_id}/signing-payload")
+def currency_shield_signing_payload(conversion_id: str,
+                                    user: User = Depends(current_user)) -> dict:
+    with session_scope() as session:
+        conversion = get_fx_conversion(session, conversion_id, user.id)
+        if not conversion:
+            raise HTTPException(status_code=404, detail="Conversion not found")
+        if conversion.status != "PENDING_SIGNATURE":
+            raise HTTPException(status_code=409, detail="Conversion is not awaiting a signature")
+        proposal_id = conversion.bmoni_conversion_id
+    result = bmoni.get_proposal_signing_payload(
+        bmoni_user_id=user.bmoni_user_id or "", proposal_id=proposal_id
+    )
+    return result["data"]
+
+
+@app.post("/v1/fx/conversions/{conversion_id}/signature")
+def submit_currency_shield_signature(conversion_id: str, payload: ProposalSignatureRequest,
+                                     request: Request,
+                                     user: User = Depends(current_user)) -> dict:
+    enforce_rate_limit(request, scope=f"financial-fx-signature:{user.id}",
+                       limit=settings.financial_rate_limit_per_minute, window_seconds=60)
+    with session_scope() as session:
+        conversion = get_fx_conversion(session, conversion_id, user.id)
+        if not conversion:
+            raise HTTPException(status_code=404, detail="Conversion not found")
+        if conversion.status != "PENDING_SIGNATURE":
+            raise HTTPException(status_code=409, detail="Conversion is not awaiting a signature")
+        proposal_id = conversion.bmoni_conversion_id
+    remote = bmoni.submit_proposal_signature(
+        bmoni_user_id=user.bmoni_user_id or "", proposal_id=proposal_id,
+        signature=payload.signature,
+    )
+    with session_scope() as session:
+        conversion = get_fx_conversion(session, conversion_id, user.id)
+        recommendation = get_recommendation(session, conversion.recommendation_id, user.id)
+        _reconcile_fx(conversion, recommendation, remote)
+        add_audit(session, event_id=new_id("aud"), actor_user_id=user.id,
+                  action="FX_SIGNATURE_SUBMIT", resource_type="FX_CONVERSION",
+                  resource_id=conversion_id, outcome=conversion.status)
+        result = {"id": conversion.id, "bmoni_proposal_id": proposal_id,
+                  "status": conversion.status,
+                  "money_has_moved": conversion.status == "COMPLETED"}
+    return result

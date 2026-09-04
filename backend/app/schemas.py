@@ -61,3 +61,7 @@ class FxQuoteRequest(BaseModel):
     amount_minor: int = Field(gt=0)
     source_currency: str = "CNGN"
     target_currency: str = "USD"
+
+
+class ProposalSignatureRequest(BaseModel):
+    signature: str = Field(pattern=r"^0x[a-fA-F0-9]{130}$")

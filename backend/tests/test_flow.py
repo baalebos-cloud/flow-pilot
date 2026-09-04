@@ -96,7 +96,24 @@ def test_complete_demo_flow(tmp_path: Path, monkeypatch):
             headers={**headers, "Idempotency-Key": "fx-demo-request-001"},
         )
         assert conversion.status_code == 201
-        assert conversion.json()["status"] == "COMPLETED"
+        assert conversion.json()["status"] == "PENDING_SIGNATURE"
+        assert conversion.json()["money_has_moved"] is False
+
+        fx_signing = client.get(
+            f"/v1/fx/conversions/{conversion.json()['id']}/signing-payload",
+            headers=headers,
+        )
+        assert fx_signing.status_code == 200
+        assert len(fx_signing.json()["hashToSign"]) == 66
+
+        fx_submitted = client.post(
+            f"/v1/fx/conversions/{conversion.json()['id']}/signature",
+            headers=headers,
+            json={"signature": "0x" + "a" * 130},
+        )
+        assert fx_submitted.status_code == 200
+        assert fx_submitted.json()["status"] == "COMPLETED"
+        assert fx_submitted.json()["money_has_moved"] is True
 
     get_engine().dispose()
     reset_engine_for_tests()

@@ -319,14 +319,40 @@ class BmoniGateway:
             "expiresInSeconds": 60,
         }
 
-    def execute_fx_conversion(self, *, quote_id: str, idempotency_key: str) -> dict:
-        if self.mode != "mock":
-            self._live_unconfigured("execute_fx_conversion")
-        return {
-            "id": f"bm_fx_{uuid.uuid4().hex[:16]}",
-            "status": "COMPLETED",
-            "quote_id": quote_id,
-        }
+    @staticmethod
+    def _proposal(result: dict, operation: str) -> dict:
+        try:
+            proposal = result["data"]["proposal"]
+            if not proposal.get("id") or not proposal.get("status"):
+                raise KeyError
+        except (KeyError, TypeError) as exc:
+            raise BmoniError(
+                f"BMONI {operation} response is invalid",
+                code="BMONI_INVALID_RESPONSE",
+            ) from exc
+        return proposal
+
+    def create_swap_proposal(
+        self, *, bmoni_user_id: str, smart_wallet_id: str,
+        amount_decimal: str, from_stablecoin: str = "CNGN",
+        to_stablecoin: str = "USDB", slippage_bps: int = 50,
+    ) -> dict:
+        if self.mode == "mock":
+            return {"data": {"proposal": {
+                "id": f"bm_prp_{uuid.uuid4().hex[:16]}",
+                "status": "PENDING_APPROVALS",
+            }}}
+        result = self._request(
+            "POST", f"/v1/users/{bmoni_user_id}/smart-wallets/{smart_wallet_id}/proposals",
+            json_body={"proposal": {
+                "type": "SWAP", "fromStablecoin": from_stablecoin,
+                "toStablecoin": to_stablecoin, "fromAmount": amount_decimal,
+                "slippageBps": slippage_bps,
+                "description": "FlowPilot Currency Shield conversion",
+            }},
+        )
+        self._proposal(result, "proposal creation")
+        return result
 
     def approve_proposal(self, *, bmoni_user_id: str, proposal_id: str) -> dict:
         if self.mode == "mock":
@@ -342,15 +368,43 @@ class BmoniGateway:
             "POST",
             f"/v1/users/{bmoni_user_id}/smart-wallets/proposals/{proposal_id}/approve",
         )
-        try:
-            proposal = result["data"]["proposal"]
-            if not proposal.get("id") or not proposal.get("status"):
-                raise KeyError
-        except (KeyError, TypeError) as exc:
-            raise BmoniError(
-                "BMONI proposal approval response is invalid",
-                code="BMONI_INVALID_RESPONSE",
-            ) from exc
+        self._proposal(result, "proposal approval")
+        return result
+
+    def get_proposal(self, *, bmoni_user_id: str, proposal_id: str) -> dict:
+        if self.mode == "mock":
+            return {"data": {"proposal": {"id": proposal_id, "status": "PENDING_SIGNATURES"}}}
+        result = self._request(
+            "GET", f"/v1/users/{bmoni_user_id}/smart-wallets/proposals/{proposal_id}"
+        )
+        self._proposal(result, "proposal lookup")
+        return result
+
+    def get_proposal_signing_payload(self, *, bmoni_user_id: str, proposal_id: str) -> dict:
+        if self.mode == "mock":
+            digest = hashlib.sha256(proposal_id.encode()).hexdigest()
+            return {"data": {"method": "eth_sign", "walletIndex": 0,
+                    "workflowId": f"wf_{proposal_id}", "proposalId": proposal_id,
+                    "hashToSign": f"0x{digest}", "payload": {}, "deadline": 4102444800}}
+        result = self._request(
+            "GET", f"/v1/users/{bmoni_user_id}/smart-wallets/proposals/{proposal_id}/sign-payload"
+        )
+        data = result.get("data") if isinstance(result, dict) else None
+        required = {"method", "walletIndex", "workflowId", "hashToSign", "payload", "deadline"}
+        if not isinstance(data, dict) or not required.issubset(data):
+            raise BmoniError("BMONI signing payload is invalid", code="BMONI_INVALID_RESPONSE")
+        return result
+
+    def submit_proposal_signature(
+        self, *, bmoni_user_id: str, proposal_id: str, signature: str
+    ) -> dict:
+        if self.mode == "mock":
+            return {"data": {"proposal": {"id": proposal_id, "status": "COMPLETED"}}}
+        result = self._request(
+            "POST", f"/v1/users/{bmoni_user_id}/smart-wallets/proposals/{proposal_id}/sign",
+            json_body={"signature": signature},
+        )
+        self._proposal(result, "signature submission")
         return result
 
 
