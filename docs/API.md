@@ -20,7 +20,10 @@ Interactive documentation is available at `/docs` while the service runs.
 | POST | `/v1/ai/recommend` | Produce a typed candidate from backend-owned context; never execute it |
 | POST/GET | `/v1/pockets` | Create/list virtual pockets |
 | POST | `/v1/recommendations/currency-shield` | Deterministic eligibility and explanation |
-| POST | `/v1/recommendations/{id}/approve` | Quote and execute approved mock conversion |
+| POST | `/v1/recommendations/{id}/approve` | Revalidate balance, create/approve BMONI SWAP proposal |
+| GET | `/v1/fx/conversions/{id}` | Reconcile conversion status with BMONI |
+| GET | `/v1/fx/conversions/{id}/signing-payload` | Return BMONI hash for on-device signing |
+| POST | `/v1/fx/conversions/{id}/signature` | Submit the device signature to BMONI |
 | POST | `/v1/action-plans` | Legacy withdrawal plan retained for reference demo |
 | POST | `/v1/action-plans/{id}/approve` | Create mock withdrawal proposal |
 | GET | `/v1/transactions/{id}/signing-payload` | Payload for on-device signing |
@@ -35,4 +38,4 @@ Interactive documentation is available at `/docs` while the service runs.
 - Error responses use stable codes before frontend integration begins.
 - `BMONI_MODE=mock` responses are synthetic and must be labelled in the demo UI.
 - Registration requires `first_name`, `last_name`, and `phone_number` in E.164 form, such as `+2348012345678`.
-- Only user provisioning is sandbox-enabled today; unimplemented signed financial operations fail closed.
+- Currency Shield uses BMONI's proposal lifecycle; the backend never receives a PIN or private key.

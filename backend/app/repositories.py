@@ -89,6 +89,14 @@ def get_fx_by_idempotency(session: Session, user_id: str, key: str) -> FxConvers
     )
 
 
+def get_fx_conversion(session: Session, conversion_id: str, user_id: str) -> FxConversion | None:
+    return session.scalar(
+        select(FxConversion).where(
+            FxConversion.id == conversion_id, FxConversion.user_id == user_id
+        )
+    )
+
+
 def get_webhook_event(session: Session, event_id: str) -> WebhookEvent | None:
     return session.get(WebhookEvent, event_id)
 
@@ -122,4 +130,3 @@ def add_audit(
             created_at=utc_now(),
         )
     )
-
