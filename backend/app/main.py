@@ -1,13 +1,15 @@
+
 import hashlib
 import hmac
 import json
-import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import InvalidTokenError
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.ai.contracts import (
     RecommendationContext,
@@ -16,16 +18,52 @@ from app.ai.contracts import (
     RecipientContext,
     RecipientType,
 )
+from app.ai.engine import Member3Engine
 from app.ai.service import RecommendationService
-from app.bmoni import BmoniConfigurationError, bmoni
+from app.bmoni import BmoniError, bmoni
+from app.balances import (
+    available_balance_minor,
+    fetch_wallet_balances,
+    minor_to_decimal,
+)
 from app.config import settings
-from app.db import connection, init_db, json_text, now_iso, row_dict
+from app.database import session_scope
+from app.models import (
+    ActionPlan,
+    FxConversion,
+    Pocket,
+    Recommendation,
+    Transaction,
+    User,
+    Wallet,
+    WebhookEvent,
+)
+from app.repositories import (
+    add_audit,
+    get_action_plan,
+    get_fx_by_idempotency,
+    get_pocket,
+    get_recommendation,
+    get_transaction,
+    get_transaction_by_idempotency,
+    get_transaction_by_proposal,
+    get_user_by_email,
+    get_user_by_id,
+    get_wallet_by_user,
+    get_webhook_event,
+    list_user_pockets,
+    utc_now,
+)
+from app.rate_limit import enforce_rate_limit
 from app.schemas import (
     ActionPlanRequest,
     AIRecommendationRequest,
     CurrencyShieldRequest,
+    FxQuoteRequest,
     LoginRequest,
     PocketCreateRequest,
+    ManagedWalletCreateRequest,
+    OwnerProofChallengeRequest,
     RegisterRequest,
     SignatureRequest,
     WalletLinkRequest,
@@ -36,17 +74,25 @@ from app.security import (
     hash_password,
     verify_password,
 )
+from app.workflow import (
+    ACTION_PLAN_TRANSITIONS,
+    RECOMMENDATION_TRANSITIONS,
+    TRANSACTION_TRANSITIONS,
+    ActionPlanStatus,
+    RecommendationStatus,
+    TransactionStatus,
+    transition,
+)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    init_db()
-    yield
+    yield  # Alembic owns schema lifecycle.
 
 
 app = FastAPI(
     title="FlowPilot API",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -57,9 +103,16 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def model_dict(item) -> dict:
+    return {
+        column.name: getattr(item, column.name)
+        for column in item.__table__.columns
+    }
+
+
 def current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
-) -> dict:
+) -> User:
     if not credentials:
         raise HTTPException(
             status_code=401,
@@ -74,35 +127,82 @@ def current_user(
             detail="Invalid or expired access token",
         )
 
-    with connection() as conn:
-        user = row_dict(
-            conn.execute(
-                "SELECT * FROM users WHERE id = ?",
-                (user_id,),
-            ).fetchone()
-        )
+    with session_scope() as session:
+        user = get_user_by_id(session, user_id)
 
-    if not user:
-        raise HTTPException(
-            status_code=401,
-            detail="User no longer exists",
-        )
+        if not user or user.provisioning_status != "ACTIVE":
+            raise HTTPException(
+                status_code=401,
+                detail="User is unavailable",
+            )
 
-    return user
+        session.expunge(user)
+        return user
 
 
-@app.exception_handler(BmoniConfigurationError)
-async def bmoni_config_error(
-    _: Request,
-    exc: BmoniConfigurationError,
-):
+@app.exception_handler(BmoniError)
+async def bmoni_error(_: Request, exc: BmoniError):
     from fastapi.responses import JSONResponse
 
     return JSONResponse(
-        status_code=503,
-        content={"detail": str(exc)},
+        status_code=exc.status_code,
+        content={
+            "detail": str(exc),
+            "code": exc.code,
+            "retryable": exc.retryable,
+        },
     )
 
+
+# ---------------------------------------------------------------------------
+# Member 3 - AI Recommendation
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/ai/recommend")
+async def ai_recommend(payload: AIRecommendationRequest) -> dict:
+    """
+    Interpret a user's financial instruction and return a typed recommendation.
+
+    This endpoint is recommendation-only.
+
+    It does NOT:
+    - create an action plan
+    - approve an action
+    - create a BMONI proposal
+    - sign a transaction
+    - execute a transaction
+    - move money
+    - access private keys
+
+    Backend policy and explicit user approval remain authoritative.
+    """
+
+    request = RecommendationRequest(
+        message=payload.message,
+        recommendation_type=RecommendationType.BANK_WITHDRAWAL,
+        context=RecommendationContext(
+            available_balance_minor=30_000_000,
+            currency="CNGN",
+        ),
+        recipient=RecipientContext(
+            recipient_type=RecipientType.SAVED_BANK,
+            recipient_id="demo-bank-recipient",
+        ),
+    )
+
+    service = RecommendationService(Member3Engine())
+
+    outcome = await service.recommend(request)
+
+    if hasattr(outcome, "root"):
+        return outcome.root.model_dump(mode="json")
+
+    return outcome.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 
 @app.get("/health")
 def health() -> dict:
@@ -112,101 +212,157 @@ def health() -> dict:
     }
 
 
-@app.post("/v1/auth/register", status_code=201)
-def register(payload: RegisterRequest) -> dict:
-    user_id = new_id("usr")
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
 
-    with connection() as conn:
-        if conn.execute(
-            "SELECT 1 FROM users WHERE email = ?",
-            (str(payload.email).lower(),),
-        ).fetchone():
-            raise HTTPException(
-                status_code=409,
-                detail="A FlowPilot account with this email already exists",
-            )
+@app.post("/v1/auth/register", status_code=201)
+def register(
+    payload: RegisterRequest,
+    request: Request,
+) -> dict:
+    enforce_rate_limit(
+        request,
+        scope="auth-register",
+        limit=settings.auth_rate_limit_per_minute,
+        window_seconds=60,
+    )
+
+    email, user_id = str(payload.email).lower(), new_id("usr")
 
     try:
-        remote = bmoni.create_user(
-            external_id=user_id,
-            email=str(payload.email),
-            name=payload.name,
-        )
+        with session_scope() as session:
+            if get_user_by_email(session, email):
+                raise HTTPException(
+                    status_code=409,
+                    detail="A FlowPilot account with this email already exists",
+                )
 
-        with connection() as conn:
-            conn.execute(
-                "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    user_id,
-                    str(payload.email).lower(),
-                    payload.name,
-                    hash_password(payload.password),
-                    remote["id"],
-                    now_iso(),
-                ),
+            session.add(
+                User(
+                    id=user_id,
+                    email=email,
+                    name=f"{payload.first_name} {payload.last_name}",
+                    password_hash=hash_password(payload.password),
+                    provisioning_status="PENDING",
+                    created_at=utc_now(),
+                )
             )
 
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         raise HTTPException(
             status_code=409,
             detail="A FlowPilot account with this email already exists",
         )
 
+    try:
+        remote = bmoni.create_user(
+            external_id=user_id,
+            email=email,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            phone_number=payload.phone_number,
+        )
+
+    except Exception:
+        with session_scope() as session:
+            user = get_user_by_id(session, user_id)
+
+            if user:
+                user.provisioning_status = "FAILED"
+
+        raise
+
+    with session_scope() as session:
+        user = get_user_by_id(session, user_id)
+
+        if not user:
+            raise HTTPException(
+                status_code=500,
+                detail="Provisioned user record disappeared",
+            )
+
+        user.bmoni_user_id = remote["id"]
+        user.provisioning_status = "ACTIVE"
+
+        add_audit(
+            session,
+            event_id=new_id("aud"),
+            actor_user_id=user_id,
+            action="BMONI_USER_PROVISION",
+            resource_type="USER",
+            resource_id=user_id,
+            outcome="SUCCEEDED",
+        )
+
+        session.flush()
+
+        result = model_dict(user)
+        result.pop("password_hash")
+
     return {
         "access_token": create_access_token(user_id),
         "token_type": "bearer",
-        "user": {
-            "id": user_id,
-            "email": str(payload.email),
-            "name": payload.name,
-            "bmoni_user_id": remote["id"],
-        },
+        "user": result,
     }
 
 
 @app.post("/v1/auth/login")
-def login(payload: LoginRequest) -> dict:
-    with connection() as conn:
-        user = row_dict(
-            conn.execute(
-                "SELECT * FROM users WHERE email = ?",
-                (str(payload.email).lower(),),
-            ).fetchone()
+def login(
+    payload: LoginRequest,
+    request: Request,
+) -> dict:
+    enforce_rate_limit(
+        request,
+        scope="auth-login",
+        limit=settings.auth_rate_limit_per_minute,
+        window_seconds=60,
+    )
+
+    with session_scope() as session:
+        user = get_user_by_email(
+            session,
+            str(payload.email).lower(),
         )
 
-    if not user or not verify_password(
-        payload.password,
-        user["password_hash"],
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password",
-        )
+        if not user or not verify_password(
+            payload.password,
+            user.password_hash,
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid email or password",
+            )
+
+        if user.provisioning_status != "ACTIVE":
+            raise HTTPException(
+                status_code=403,
+                detail="Account provisioning is incomplete",
+            )
+
+        user_id = user.id
 
     return {
-        "access_token": create_access_token(user["id"]),
+        "access_token": create_access_token(user_id),
         "token_type": "bearer",
     }
 
 
 @app.get("/v1/me")
-def me(user: dict = Depends(current_user)) -> dict:
-    return {
-        k: user[k]
-        for k in (
-            "id",
-            "email",
-            "name",
-            "bmoni_user_id",
-            "created_at",
-        )
-    }
+def me(user: User = Depends(current_user)) -> dict:
+    result = model_dict(user)
+    result.pop("password_hash")
+    return result
 
+
+# ---------------------------------------------------------------------------
+# Wallets
+# ---------------------------------------------------------------------------
 
 @app.post("/v1/wallets/link", status_code=201)
 def link_wallet(
     payload: WalletLinkRequest,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
     currency = payload.currency.upper()
 
@@ -216,8 +372,15 @@ def link_wallet(
             detail="The MVP currently supports CNGN only",
         )
 
+    with session_scope() as session:
+        if get_wallet_by_user(session, user.id):
+            raise HTTPException(
+                status_code=409,
+                detail="This user already has a linked wallet",
+            )
+
     remote = bmoni.link_wallet(
-        bmoni_user_id=user["bmoni_user_id"],
+        bmoni_user_id=user.bmoni_user_id or "",
         address=payload.wallet_address,
         currency=currency,
     )
@@ -225,21 +388,30 @@ def link_wallet(
     wallet_id = new_id("wal")
 
     try:
-        with connection() as conn:
-            conn.execute(
-                "INSERT INTO wallets VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    wallet_id,
-                    user["id"],
-                    remote["id"],
-                    payload.wallet_address,
-                    currency,
-                    remote["status"],
-                    now_iso(),
-                ),
+        with session_scope() as session:
+            session.add(
+                Wallet(
+                    id=wallet_id,
+                    user_id=user.id,
+                    bmoni_wallet_id=remote["id"],
+                    wallet_address=payload.wallet_address,
+                    currency=currency,
+                    status=remote["status"],
+                    created_at=utc_now(),
+                )
             )
 
-    except sqlite3.IntegrityError:
+            add_audit(
+                session,
+                event_id=new_id("aud"),
+                actor_user_id=user.id,
+                action="WALLET_LINK",
+                resource_type="WALLET",
+                resource_id=wallet_id,
+                outcome="SUCCEEDED",
+            )
+
+    except IntegrityError:
         raise HTTPException(
             status_code=409,
             detail="This user or wallet address is already linked",
@@ -253,58 +425,266 @@ def link_wallet(
     }
 
 
-@app.post("/v1/ai/recommend")
-async def ai_recommend(
-    payload: AIRecommendationRequest,
-    user: dict = Depends(current_user),
+@app.post(
+    "/v1/wallets/owner-proof-challenges",
+    status_code=201,
+)
+def create_owner_proof_challenge(
+    payload: OwnerProofChallengeRequest,
+    user: User = Depends(current_user),
 ) -> dict:
-    """
-    Interpret the user's financial request.
+    currency = payload.currency.upper()
 
-    This endpoint stops at an AI recommendation.
+    if currency != "CNGN":
+        raise HTTPException(
+            status_code=422,
+            detail="The MVP currently supports CNGN only",
+        )
 
-    It does NOT:
-    - create a BMONI proposal
-    - sign a transaction
-    - access private keys
-    - execute a transaction
-    - move money
-    - bypass backend policy
-    """
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
 
-    request = RecommendationRequest(
-        request_id=new_id("ai"),
-        user_message=payload.message,
-        context=RecommendationContext(
-            base_currency="CNGN",
-            recipients=[
-                RecipientContext(
-                    reference_id="own_bank",
-                    type=RecipientType.SAVED_BANK,
-                    display_name="My bank",
-                    currency="CNGN",
-                )
-            ],
-            allowed_recommendation_types={
-                RecommendationType.BANK_WITHDRAWAL,
-            },
-        ),
+    challenge = bmoni.create_owner_proof_challenge(
+        bmoni_user_id=user.bmoni_user_id,
+        owner_address=payload.owner_address,
+        currency=currency,
     )
 
-    service = RecommendationService()
+    required = {
+        "challengeId",
+        "groupId",
+        "message",
+        "expiresAt",
+    }
 
-    outcome = await service.recommend(request)
+    if not isinstance(challenge, dict) or not required.issubset(challenge):
+        raise BmoniError(
+            "BMONI owner-proof response is invalid",
+            code="BMONI_INVALID_RESPONSE",
+        )
 
-    return outcome.root.model_dump(mode="json")
+    return {
+        key: challenge[key]
+        for key in required
+    }
 
+
+@app.post(
+    "/v1/wallets/managed",
+    status_code=201,
+)
+def create_managed_wallet(
+    payload: ManagedWalletCreateRequest,
+    user: User = Depends(current_user),
+) -> dict:
+    currency = payload.currency.upper()
+
+    if currency != "CNGN":
+        raise HTTPException(
+            status_code=422,
+            detail="The MVP currently supports CNGN only",
+        )
+
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
+
+    with session_scope() as session:
+        existing = get_wallet_by_user(session, user.id)
+
+        if existing:
+            return model_dict(existing)
+
+    remote = bmoni.create_managed_wallet(
+        bmoni_user_id=user.bmoni_user_id,
+        owner_address=payload.owner_address,
+        currency=currency,
+        challenge_id=payload.challenge_id,
+        signature=payload.signature,
+    )
+
+    try:
+        remote_id = str(remote["id"])
+        wallet_address = str(remote["walletAddress"])
+        active = bool(remote["isActive"])
+
+    except (KeyError, TypeError) as exc:
+        raise BmoniError(
+            "BMONI managed-wallet response is invalid",
+            code="BMONI_INVALID_RESPONSE",
+        ) from exc
+
+    if not wallet_address.startswith("0x"):
+        raise BmoniError(
+            "BMONI managed wallet has no deployed address",
+            code="BMONI_WALLET_NOT_DEPLOYED",
+            retryable=True,
+        )
+
+    wallet_id = new_id("wal")
+    status = "ACTIVE" if active else "PENDING"
+
+    try:
+        with session_scope() as session:
+            session.add(
+                Wallet(
+                    id=wallet_id,
+                    user_id=user.id,
+                    bmoni_wallet_id=remote_id,
+                    wallet_address=wallet_address,
+                    currency=currency,
+                    status=status,
+                    created_at=utc_now(),
+                )
+            )
+
+            add_audit(
+                session,
+                event_id=new_id("aud"),
+                actor_user_id=user.id,
+                action="MANAGED_WALLET_CREATE",
+                resource_type="WALLET",
+                resource_id=wallet_id,
+                outcome="SUCCEEDED",
+            )
+
+    except IntegrityError:
+        with session_scope() as session:
+            existing = get_wallet_by_user(session, user.id)
+
+            if existing:
+                return model_dict(existing)
+
+        raise
+
+    return {
+        "id": wallet_id,
+        "bmoni_wallet_id": remote_id,
+        "wallet_address": wallet_address,
+        "currency": currency,
+        "status": status,
+    }
+
+
+@app.get("/v1/wallets/balances")
+def wallet_balances(
+    user: User = Depends(current_user),
+) -> dict:
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
+
+    balances = fetch_wallet_balances(
+        bmoni,
+        bmoni_user_id=user.bmoni_user_id,
+    )
+
+    return {
+        "balances": [
+            balance.model_dump()
+            for balance in balances
+        ]
+    }
+
+
+# ---------------------------------------------------------------------------
+# FX
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/fx/quotes")
+def create_fx_quote(
+    payload: FxQuoteRequest,
+    user: User = Depends(current_user),
+) -> dict:
+    if not user.bmoni_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="BMONI user provisioning is incomplete",
+        )
+
+    source = payload.source_currency.upper()
+    target = payload.target_currency.upper()
+
+    if (source, target) != ("CNGN", "USD"):
+        raise HTTPException(
+            status_code=422,
+            detail="The MVP supports CNGN to USD only",
+        )
+
+    balance_minor = available_balance_minor(
+        bmoni,
+        bmoni_user_id=user.bmoni_user_id,
+        currency=source,
+    )
+
+    if payload.amount_minor > balance_minor:
+        raise HTTPException(
+            status_code=422,
+            detail="Insufficient authoritative balance",
+        )
+
+    quote = bmoni.get_fx_quote(
+        bmoni_user_id=user.bmoni_user_id,
+        amount_decimal=minor_to_decimal(
+            payload.amount_minor,
+            "NGN",
+        ),
+        source="NGN",
+        target=target,
+    )
+
+    required = {
+        "quoteId",
+        "fromCurrency",
+        "toCurrency",
+        "amountIn",
+        "amountOut",
+        "exchangeRate",
+        "fees",
+        "quotedAt",
+        "expiresAt",
+        "expiresInSeconds",
+    }
+
+    if not isinstance(quote, dict) or not required.issubset(quote):
+        raise BmoniError(
+            "BMONI quote response is invalid",
+            code="BMONI_INVALID_RESPONSE",
+        )
+
+    return {
+        "quote_id": quote["quoteId"],
+        "source_currency": source,
+        "target_currency": target,
+        "source_amount_minor": payload.amount_minor,
+        "target_amount": quote["amountOut"],
+        "exchange_rate": quote["exchangeRate"],
+        "fees": quote["fees"],
+        "quoted_at": quote["quotedAt"],
+        "expires_at": quote["expiresAt"],
+        "expires_in_seconds": quote["expiresInSeconds"],
+        "money_has_moved": False,
+        "requires_user_approval": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Action Plans
+# ---------------------------------------------------------------------------
 
 @app.post("/v1/action-plans", status_code=201)
 def create_action_plan(
     payload: ActionPlanRequest,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    currency = payload.currency.upper()
-    failures = []
+    currency, failures = payload.currency.upper(), []
 
     if currency != "CNGN":
         failures.append("UNSUPPORTED_CURRENCY")
@@ -330,23 +710,22 @@ def create_action_plan(
         - payload.amount_minor
     )
 
-    with connection() as conn:
-        conn.execute(
-            "INSERT INTO action_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                plan_id,
-                user["id"],
-                "BANK_WITHDRAWAL",
-                payload.amount_minor,
-                currency,
-                payload.recipient_name,
-                payload.message,
-                payload.available_balance_minor,
-                expected,
-                "PASSED",
-                "AWAITING_USER_APPROVAL",
-                now_iso(),
-            ),
+    with session_scope() as session:
+        session.add(
+            ActionPlan(
+                id=plan_id,
+                user_id=user.id,
+                action_type="BANK_WITHDRAWAL",
+                amount_minor=payload.amount_minor,
+                currency=currency,
+                recipient_name=payload.recipient_name,
+                reason=payload.message,
+                available_balance_minor=payload.available_balance_minor,
+                expected_balance_minor=expected,
+                risk_status="PASSED",
+                approval_status="AWAITING_USER_APPROVAL",
+                created_at=utc_now(),
+            )
         )
 
     return {
@@ -370,45 +749,38 @@ def create_action_plan(
 )
 def approve_action_plan(
     plan_id: str,
+    request: Request,
     idempotency_key: str = Header(
         min_length=8,
         max_length=128,
         alias="Idempotency-Key",
     ),
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    with connection() as conn:
-        existing = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM transactions
-                WHERE user_id = ?
-                AND idempotency_key = ?
-                """,
-                (
-                    user["id"],
-                    idempotency_key,
-                ),
-            ).fetchone()
+    enforce_rate_limit(
+        request,
+        scope=f"financial-approval:{user.id}",
+        limit=settings.financial_rate_limit_per_minute,
+        window_seconds=60,
+    )
+
+    with session_scope() as session:
+        existing = get_transaction_by_idempotency(
+            session,
+            user.id,
+            idempotency_key,
         )
 
         if existing:
-            return existing
+            return model_dict(existing)
 
-        plan = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM action_plans
-                WHERE id = ?
-                AND user_id = ?
-                """,
-                (
-                    plan_id,
-                    user["id"],
-                ),
-            ).fetchone()
+        plan = session.scalar(
+            select(ActionPlan)
+            .where(
+                ActionPlan.id == plan_id,
+                ActionPlan.user_id == user.id,
+            )
+            .with_for_update()
         )
 
         if not plan:
@@ -417,44 +789,110 @@ def approve_action_plan(
                 detail="Action plan not found",
             )
 
-        if plan["approval_status"] != "AWAITING_USER_APPROVAL":
+        if (
+            plan.approval_status
+            != ActionPlanStatus.AWAITING_USER_APPROVAL
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="Action plan cannot be approved in its current state",
             )
 
+        plan.approval_status = transition(
+            plan.approval_status,
+            ActionPlanStatus.CREATING_PROPOSAL,
+            ACTION_PLAN_TRANSITIONS,
+        )
+
+        snapshot = (
+            plan.amount_minor,
+            plan.currency,
+            plan.recipient_name,
+        )
+
+    try:
         proposal = bmoni.create_withdrawal_proposal(
-            bmoni_user_id=user["bmoni_user_id"],
-            amount_minor=plan["amount_minor"],
-            currency=plan["currency"],
-            recipient_name=plan["recipient_name"],
+            bmoni_user_id=user.bmoni_user_id or "",
+            amount_minor=snapshot[0],
+            currency=snapshot[1],
+            recipient_name=snapshot[2],
         )
 
-        transaction_id = new_id("txn")
-
-        conn.execute(
-            """
-            UPDATE action_plans
-            SET approval_status = 'APPROVED'
-            WHERE id = ?
-            """,
-            (plan_id,),
-        )
-
-        conn.execute(
-            "INSERT INTO transactions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
-            (
-                transaction_id,
-                user["id"],
+    except Exception:
+        with session_scope() as session:
+            failed_plan = get_action_plan(
+                session,
                 plan_id,
-                proposal["id"],
-                plan["amount_minor"],
-                plan["currency"],
-                "PENDING_SIGNATURE",
-                proposal["status"],
-                idempotency_key,
-                now_iso(),
-            ),
+                user.id,
+            )
+
+            if (
+                failed_plan
+                and failed_plan.approval_status
+                == ActionPlanStatus.CREATING_PROPOSAL
+            ):
+                failed_plan.approval_status = transition(
+                    failed_plan.approval_status,
+                    ActionPlanStatus.FAILED,
+                    ACTION_PLAN_TRANSITIONS,
+                )
+
+                add_audit(
+                    session,
+                    event_id=new_id("aud"),
+                    actor_user_id=user.id,
+                    action="WITHDRAWAL_APPROVE",
+                    resource_type="ACTION_PLAN",
+                    resource_id=plan_id,
+                    outcome="FAILED",
+                )
+
+        raise
+
+    transaction_id = new_id("txn")
+
+    with session_scope() as session:
+        plan = get_action_plan(
+            session,
+            plan_id,
+            user.id,
+        )
+
+        if not plan:
+            raise HTTPException(
+                status_code=404,
+                detail="Action plan not found",
+            )
+
+        plan.approval_status = transition(
+            plan.approval_status,
+            ActionPlanStatus.APPROVED,
+            ACTION_PLAN_TRANSITIONS,
+        )
+
+        session.add(
+            Transaction(
+                id=transaction_id,
+                user_id=user.id,
+                action_plan_id=plan_id,
+                bmoni_proposal_id=proposal["id"],
+                amount_minor=plan.amount_minor,
+                currency=plan.currency,
+                status="PENDING_SIGNATURE",
+                bmoni_status=proposal["status"],
+                idempotency_key=idempotency_key,
+                created_at=utc_now(),
+            )
+        )
+
+        add_audit(
+            session,
+            event_id=new_id("aud"),
+            actor_user_id=user.id,
+            action="WITHDRAWAL_APPROVE",
+            resource_type="TRANSACTION",
+            resource_id=transaction_id,
+            outcome="SUCCEEDED",
         )
 
     return {
@@ -464,43 +902,41 @@ def approve_action_plan(
     }
 
 
+# ---------------------------------------------------------------------------
+# Transactions
+# ---------------------------------------------------------------------------
+
 def owned_transaction(
     transaction_id: str,
     user_id: str,
-) -> dict:
-    with connection() as conn:
-        transaction = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM transactions
-                WHERE id = ?
-                AND user_id = ?
-                """,
-                (
-                    transaction_id,
-                    user_id,
-                ),
-            ).fetchone()
+) -> Transaction:
+    with session_scope() as session:
+        item = get_transaction(
+            session,
+            transaction_id,
+            user_id,
         )
 
-    if not transaction:
-        raise HTTPException(
-            status_code=404,
-            detail="Transaction not found",
-        )
+        if not item:
+            raise HTTPException(
+                status_code=404,
+                detail="Transaction not found",
+            )
 
-    return transaction
+        session.expunge(item)
+        return item
 
 
 @app.get("/v1/transactions/{transaction_id}")
-def get_transaction(
+def read_transaction(
     transaction_id: str,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    return owned_transaction(
-        transaction_id,
-        user["id"],
+    return model_dict(
+        owned_transaction(
+            transaction_id,
+            user.id,
+        )
     )
 
 
@@ -509,21 +945,21 @@ def get_transaction(
 )
 def signing_payload(
     transaction_id: str,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    transaction = owned_transaction(
+    item = owned_transaction(
         transaction_id,
-        user["id"],
+        user.id,
     )
 
-    if transaction["status"] != "PENDING_SIGNATURE":
+    if item.status != "PENDING_SIGNATURE":
         raise HTTPException(
             status_code=409,
             detail="Transaction is not awaiting a signature",
         )
 
     return bmoni.get_signing_payload(
-        proposal_id=transaction["bmoni_proposal_id"]
+        proposal_id=item.bmoni_proposal_id
     )
 
 
@@ -533,14 +969,22 @@ def signing_payload(
 def submit_signature(
     transaction_id: str,
     payload: SignatureRequest,
-    user: dict = Depends(current_user),
+    request: Request,
+    user: User = Depends(current_user),
 ) -> dict:
-    transaction = owned_transaction(
-        transaction_id,
-        user["id"],
+    enforce_rate_limit(
+        request,
+        scope=f"financial-signature:{user.id}",
+        limit=settings.financial_rate_limit_per_minute,
+        window_seconds=60,
     )
 
-    if transaction["status"] != "PENDING_SIGNATURE":
+    item = owned_transaction(
+        transaction_id,
+        user.id,
+    )
+
+    if item.status != "PENDING_SIGNATURE":
         raise HTTPException(
             status_code=409,
             detail="Transaction is not awaiting a signature",
@@ -548,7 +992,7 @@ def submit_signature(
 
     try:
         remote = bmoni.submit_signature(
-            proposal_id=transaction["bmoni_proposal_id"],
+            proposal_id=item.bmoni_proposal_id,
             signature=payload.signature,
         )
 
@@ -564,27 +1008,41 @@ def submit_signature(
         else "PROCESSING"
     )
 
-    completed_at = (
-        now_iso()
-        if local_status == "COMPLETED"
-        else None
-    )
+    with session_scope() as session:
+        stored = get_transaction(
+            session,
+            transaction_id,
+            user.id,
+        )
 
-    with connection() as conn:
-        conn.execute(
-            """
-            UPDATE transactions
-            SET status = ?,
-                bmoni_status = ?,
-                completed_at = ?
-            WHERE id = ?
-            """,
-            (
-                local_status,
-                remote["status"],
-                completed_at,
-                transaction_id,
-            ),
+        if not stored:
+            raise HTTPException(
+                status_code=404,
+                detail="Transaction not found",
+            )
+
+        stored.status = transition(
+            stored.status,
+            TransactionStatus(local_status),
+            TRANSACTION_TRANSITIONS,
+        )
+
+        stored.bmoni_status = remote["status"]
+
+        stored.completed_at = (
+            utc_now()
+            if local_status == "COMPLETED"
+            else None
+        )
+
+        add_audit(
+            session,
+            event_id=new_id("aud"),
+            actor_user_id=user.id,
+            action="SIGNATURE_SUBMIT",
+            resource_type="TRANSACTION",
+            resource_id=transaction_id,
+            outcome="SUCCEEDED",
         )
 
     return {
@@ -594,10 +1052,16 @@ def submit_signature(
     }
 
 
+# ---------------------------------------------------------------------------
+# BMONI Webhooks
+# ---------------------------------------------------------------------------
+
 @app.post("/v1/webhooks/bmoni")
 async def bmoni_webhook(
     request: Request,
-    x_bmoni_signature: str | None = Header(default=None),
+    x_webhook_signature: str | None = Header(default=None),
+    x_webhook_id: str | None = Header(default=None),
+    x_source_event_id: str | None = Header(default=None),
 ) -> dict:
     raw = await request.body()
 
@@ -609,9 +1073,9 @@ async def bmoni_webhook(
         ).hexdigest()
 
         if (
-            not x_bmoni_signature
+            not x_webhook_signature
             or not hmac.compare_digest(
-                x_bmoni_signature,
+                x_webhook_signature,
                 expected,
             )
         ):
@@ -630,9 +1094,11 @@ async def bmoni_webhook(
         event = json.loads(raw)
 
         event_id = str(event["id"])
-        event_type = str(event["type"])
-        proposal_id = str(event["proposal_id"])
-        remote_status = str(event["status"])
+        event_type = str(event["eventType"])
+        payload = event["payload"]
+
+        if not isinstance(payload, dict):
+            raise TypeError
 
     except (ValueError, KeyError, TypeError):
         raise HTTPException(
@@ -640,58 +1106,100 @@ async def bmoni_webhook(
             detail="Invalid webhook payload",
         )
 
-    with connection() as conn:
-        if conn.execute(
-            "SELECT 1 FROM webhook_events WHERE id = ?",
-            (event_id,),
-        ).fetchone():
+    if (
+        not x_webhook_id
+        or not hmac.compare_digest(
+            x_webhook_id,
+            event_id,
+        )
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Webhook ID header does not match body",
+        )
+
+    proposal_id = str(
+        payload.get("proposalId")
+        or payload.get("proposal_id")
+        or payload.get("withdrawalId")
+        or ""
+    )
+
+    event_status = event_type.rsplit(
+        ".",
+        maxsplit=1,
+    )[-1].upper()
+
+    remote_status = str(
+        payload.get("status")
+        or event_status
+    ).upper()
+
+    with session_scope() as session:
+        if get_webhook_event(
+            session,
+            event_id,
+        ):
             return {
                 "received": True,
                 "duplicate": True,
             }
 
-        mapping = {
-            "COMPLETED": "COMPLETED",
-            "FAILED": "FAILED",
-            "PENDING": "PROCESSING",
-        }
-
-        local_status = mapping.get(
-            remote_status,
-            "PROCESSING",
-        )
-
-        completed_at = (
-            now_iso()
-            if local_status == "COMPLETED"
+        item = (
+            get_transaction_by_proposal(
+                session,
+                proposal_id,
+            )
+            if proposal_id
             else None
         )
 
-        conn.execute(
-            """
-            UPDATE transactions
-            SET status = ?,
-                bmoni_status = ?,
-                completed_at = ?
-            WHERE bmoni_proposal_id = ?
-            """,
-            (
-                local_status,
-                remote_status,
-                completed_at,
-                proposal_id,
-            ),
+        local_status = {
+            "COMPLETED": "COMPLETED",
+            "FAILED": "FAILED",
+            "PENDING": "PROCESSING",
+        }.get(
+            remote_status,
+            "REQUIRES_REVIEW",
         )
 
-        conn.execute(
-            "INSERT INTO webhook_events VALUES (?, ?, ?, ?, 1, ?)",
-            (
-                event_id,
-                event_type,
-                proposal_id,
-                json_text(event),
-                now_iso(),
-            ),
+        if item and item.status not in {
+            "COMPLETED",
+            "FAILED",
+        }:
+            item.status = transition(
+                item.status,
+                TransactionStatus(local_status),
+                TRANSACTION_TRANSITIONS,
+            )
+
+            item.bmoni_status = remote_status
+
+            item.completed_at = (
+                utc_now()
+                if local_status == "COMPLETED"
+                else None
+            )
+
+        external_id = (
+            x_source_event_id
+            or proposal_id
+            or event_id
+        )
+
+        session.add(
+            WebhookEvent(
+                id=event_id,
+                event_type=event_type,
+                external_id=external_id,
+                payload_json=json.dumps(
+                    event,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                processed=True,
+                created_at=utc_now(),
+            )
         )
 
     return {
@@ -700,10 +1208,14 @@ async def bmoni_webhook(
     }
 
 
+# ---------------------------------------------------------------------------
+# Pockets
+# ---------------------------------------------------------------------------
+
 @app.post("/v1/pockets", status_code=201)
 def create_pocket(
     payload: PocketCreateRequest,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
     currency = payload.currency.upper()
 
@@ -716,22 +1228,22 @@ def create_pocket(
     pocket_id = new_id("pkt")
 
     try:
-        with connection() as conn:
-            conn.execute(
-                "INSERT INTO pockets VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
-                (
-                    pocket_id,
-                    user["id"],
-                    payload.name,
-                    payload.purpose,
-                    payload.allocated_minor,
-                    currency,
-                    int(payload.protected),
-                    now_iso(),
-                ),
+        with session_scope() as session:
+            session.add(
+                Pocket(
+                    id=pocket_id,
+                    user_id=user.id,
+                    name=payload.name,
+                    purpose=payload.purpose,
+                    allocated_minor=payload.allocated_minor,
+                    spent_minor=0,
+                    currency=currency,
+                    protected=payload.protected,
+                    created_at=utc_now(),
+                )
             )
 
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         raise HTTPException(
             status_code=409,
             detail="A pocket with this name already exists",
@@ -747,21 +1259,21 @@ def create_pocket(
 
 @app.get("/v1/pockets")
 def list_pockets(
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[dict]:
-    with connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM pockets
-            WHERE user_id = ?
-            ORDER BY created_at
-            """,
-            (user["id"],),
-        ).fetchall()
+    with session_scope() as session:
+        return [
+            model_dict(item)
+            for item in list_user_pockets(
+                session,
+                user.id,
+            )
+        ]
 
-    return [dict(row) for row in rows]
 
+# ---------------------------------------------------------------------------
+# Currency Shield
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/v1/recommendations/currency-shield",
@@ -769,123 +1281,110 @@ def list_pockets(
 )
 def create_currency_shield(
     payload: CurrencyShieldRequest,
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    with connection() as conn:
-        pocket = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM pockets
-                WHERE id = ?
-                AND user_id = ?
-                """,
-                (
-                    payload.pocket_id,
-                    user["id"],
-                ),
-            ).fetchone()
+    with session_scope() as session:
+        pocket = get_pocket(
+            session,
+            payload.pocket_id,
+            user.id,
         )
 
-    if not pocket:
-        raise HTTPException(
-            status_code=404,
-            detail="Pocket not found",
-        )
-
-    available = (
-        pocket["allocated_minor"]
-        - pocket["spent_minor"]
-    )
-
-    maximum = (
-        available
-        * settings.max_fx_conversion_percent
-        // 100
-    )
-
-    reasons = []
-
-    if pocket["protected"]:
-        reasons.append("PROTECTED_POCKET")
-
-    if (
-        pocket["currency"] != "CNGN"
-        or payload.target_currency.upper() != "USD"
-    ):
-        reasons.append("UNSUPPORTED_PAIR")
-
-    if payload.amount_minor > maximum:
-        reasons.append("AMOUNT_EXCEEDS_SAFETY_LIMIT")
-
-    if (
-        payload.observed_change_bps
-        > -settings.fx_alert_threshold_bps
-    ):
-        reasons.append("ALERT_THRESHOLD_NOT_REACHED")
-
-    if reasons:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "status": "NOT_RECOMMENDED",
-                "reasons": reasons,
-            },
-        )
-
-    recommendation_id = new_id("rec")
-
-    evidence = {
-        "observed_change_bps": payload.observed_change_bps,
-        "observation_window_days": payload.observation_window_days,
-        "max_conversion_percent": settings.max_fx_conversion_percent,
-    }
-
-    rationale = (
-        f"CNGN changed "
-        f"{abs(payload.observed_change_bps) / 100:.2f}% "
-        f"over {payload.observation_window_days} days. "
-        f"Consider diversifying part of this pocket."
-    )
-
-    disclosure = (
-        "Rates can move in either direction. "
-        "Conversion may include fees or spread. "
-        "No money moves without approval."
-    )
-
-    with connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO recommendations
-            VALUES (
-                ?,
-                ?,
-                ?,
-                'CURRENCY_SHIELD',
-                'AWAITING_APPROVAL',
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                NULL,
-                ?
+        if not pocket:
+            raise HTTPException(
+                status_code=404,
+                detail="Pocket not found",
             )
-            """,
-            (
-                recommendation_id,
-                user["id"],
-                pocket["id"],
-                pocket["currency"],
-                payload.target_currency.upper(),
-                payload.amount_minor,
-                rationale,
-                disclosure,
-                json_text(evidence),
-                now_iso(),
+
+        available = (
+            pocket.allocated_minor
+            - pocket.spent_minor
+        )
+
+        reasons = []
+
+        maximum = (
+            available
+            * settings.max_fx_conversion_percent
+            // 100
+        )
+
+        if pocket.protected:
+            reasons.append("PROTECTED_POCKET")
+
+        if (
+            pocket.currency != "CNGN"
+            or payload.target_currency.upper() != "USD"
+        ):
+            reasons.append("UNSUPPORTED_PAIR")
+
+        if payload.amount_minor > maximum:
+            reasons.append(
+                "AMOUNT_EXCEEDS_SAFETY_LIMIT"
+            )
+
+        if (
+            payload.observed_change_bps
+            > -settings.fx_alert_threshold_bps
+        ):
+            reasons.append(
+                "ALERT_THRESHOLD_NOT_REACHED"
+            )
+
+        if reasons:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "status": "NOT_RECOMMENDED",
+                    "reasons": reasons,
+                },
+            )
+
+        recommendation_id = new_id("rec")
+
+        evidence = {
+            "observed_change_bps": (
+                payload.observed_change_bps
             ),
+            "observation_window_days": (
+                payload.observation_window_days
+            ),
+            "max_conversion_percent": (
+                settings.max_fx_conversion_percent
+            ),
+        }
+
+        rationale = (
+            f"CNGN changed "
+            f"{abs(payload.observed_change_bps) / 100:.2f}% "
+            f"over "
+            f"{payload.observation_window_days} days. "
+            f"Consider diversifying part of this pocket."
+        )
+
+        disclosure = (
+            "Rates can move in either direction. "
+            "Conversion may include fees or spread. "
+            "No money moves without approval."
+        )
+
+        session.add(
+            Recommendation(
+                id=recommendation_id,
+                user_id=user.id,
+                pocket_id=pocket.id,
+                type="CURRENCY_SHIELD",
+                status="AWAITING_APPROVAL",
+                source_currency=pocket.currency,
+                target_currency=(
+                    payload.target_currency.upper()
+                ),
+                amount_minor=payload.amount_minor,
+                rationale=rationale,
+                risk_disclosure=disclosure,
+                evidence_json=json.dumps(evidence),
+                created_at=utc_now(),
+            )
         )
 
     return {
@@ -904,107 +1403,174 @@ def create_currency_shield(
 )
 def approve_currency_shield(
     recommendation_id: str,
+    request: Request,
     idempotency_key: str = Header(
         min_length=8,
         max_length=128,
         alias="Idempotency-Key",
     ),
-    user: dict = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict:
-    with connection() as conn:
-        existing = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM fx_conversions
-                WHERE user_id = ?
-                AND idempotency_key = ?
-                """,
-                (
-                    user["id"],
-                    idempotency_key,
-                ),
-            ).fetchone()
+    enforce_rate_limit(
+        request,
+        scope=f"financial-fx:{user.id}",
+        limit=settings.financial_rate_limit_per_minute,
+        window_seconds=60,
+    )
+
+    with session_scope() as session:
+        existing = get_fx_by_idempotency(
+            session,
+            user.id,
+            idempotency_key,
         )
 
         if existing:
-            return existing
+            return model_dict(existing)
 
-        recommendation = row_dict(
-            conn.execute(
-                """
-                SELECT *
-                FROM recommendations
-                WHERE id = ?
-                AND user_id = ?
-                """,
-                (
-                    recommendation_id,
-                    user["id"],
-                ),
-            ).fetchone()
+        recommendation = session.scalar(
+            select(Recommendation)
+            .where(
+                Recommendation.id == recommendation_id,
+                Recommendation.user_id == user.id,
+            )
+            .with_for_update()
         )
 
-    if not recommendation:
-        raise HTTPException(
-            status_code=404,
-            detail="Recommendation not found",
+        if not recommendation:
+            raise HTTPException(
+                status_code=404,
+                detail="Recommendation not found",
+            )
+
+        if (
+            recommendation.status
+            != RecommendationStatus.AWAITING_APPROVAL
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Recommendation cannot be approved",
+            )
+
+        recommendation.status = transition(
+            recommendation.status,
+            RecommendationStatus.EXECUTING,
+            RECOMMENDATION_TRANSITIONS,
         )
 
-    if recommendation["status"] != "AWAITING_APPROVAL":
+        snapshot = (
+            recommendation.amount_minor,
+            recommendation.source_currency,
+            recommendation.target_currency,
+        )
+
+    if (
+        snapshot[0] is None
+        or snapshot[1] is None
+        or snapshot[2] is None
+    ):
         raise HTTPException(
             status_code=409,
-            detail="Recommendation cannot be approved",
+            detail="Recommendation is incomplete",
         )
 
-    quote = bmoni.get_fx_quote(
-        amount_minor=recommendation["amount_minor"],
-        source=recommendation["source_currency"],
-        target=recommendation["target_currency"],
-    )
+    try:
+        quote = bmoni.get_fx_quote(
+            bmoni_user_id=user.bmoni_user_id or "",
+            amount_decimal=minor_to_decimal(
+                snapshot[0],
+                "NGN",
+            ),
+            source="NGN",
+            target=snapshot[2],
+        )
 
-    remote = bmoni.execute_fx_conversion(
-        quote_id=quote["id"],
-        idempotency_key=idempotency_key,
-    )
+        remote = bmoni.execute_fx_conversion(
+            quote_id=quote["quoteId"],
+            idempotency_key=idempotency_key,
+        )
+
+    except Exception:
+        with session_scope() as session:
+            failed_recommendation = get_recommendation(
+                session,
+                recommendation_id,
+                user.id,
+            )
+
+            if (
+                failed_recommendation
+                and failed_recommendation.status
+                == RecommendationStatus.EXECUTING
+            ):
+                failed_recommendation.status = transition(
+                    failed_recommendation.status,
+                    RecommendationStatus.FAILED,
+                    RECOMMENDATION_TRANSITIONS,
+                )
+
+                add_audit(
+                    session,
+                    event_id=new_id("aud"),
+                    actor_user_id=user.id,
+                    action="FX_CONVERSION_APPROVE",
+                    resource_type="RECOMMENDATION",
+                    resource_id=recommendation_id,
+                    outcome="FAILED",
+                )
+
+        raise
 
     conversion_id = new_id("fx")
 
-    completed_at = (
-        now_iso()
-        if remote["status"] == "COMPLETED"
-        else None
-    )
-
-    with connection() as conn:
-        conn.execute(
-            """
-            UPDATE recommendations
-            SET status = 'EXECUTED'
-            WHERE id = ?
-            """,
-            (recommendation_id,),
+    with session_scope() as session:
+        recommendation = get_recommendation(
+            session,
+            recommendation_id,
+            user.id,
         )
 
-        conn.execute(
-            """
-            INSERT INTO fx_conversions
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                conversion_id,
-                user["id"],
-                recommendation_id,
-                remote["id"],
-                remote["status"],
-                recommendation["amount_minor"],
-                recommendation["source_currency"],
-                recommendation["target_currency"],
-                json_text(quote),
-                idempotency_key,
-                now_iso(),
-                completed_at,
-            ),
+        if not recommendation:
+            raise HTTPException(
+                status_code=404,
+                detail="Recommendation not found",
+            )
+
+        recommendation.status = transition(
+            recommendation.status,
+            RecommendationStatus.EXECUTED,
+            RECOMMENDATION_TRANSITIONS,
+        )
+
+        session.add(
+            FxConversion(
+                id=conversion_id,
+                user_id=user.id,
+                recommendation_id=recommendation_id,
+                bmoni_conversion_id=remote["id"],
+                status=remote["status"],
+                source_amount_minor=snapshot[0],
+                source_currency=snapshot[1],
+                target_currency=snapshot[2],
+                quote_json=json.dumps(quote),
+                idempotency_key=idempotency_key,
+                created_at=utc_now(),
+                completed_at=(
+                    utc_now()
+                    if remote["status"] == "COMPLETED"
+                    else None
+                ),
+            )
+        )
+
+        add_audit(
+            session,
+            event_id=new_id("aud"),
+            actor_user_id=user.id,
+            action="FX_CONVERSION_APPROVE",
+            resource_type="FX_CONVERSION",
+            resource_id=conversion_id,
+            outcome="SUCCEEDED",
         )
 
     return {

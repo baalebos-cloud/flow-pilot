@@ -1,0 +1,3 @@
+import 'package:flutter/material.dart';
+import '../../app/theme/app_colors.dart';
+class SecondaryButton extends StatelessWidget { final String label; final VoidCallback? onPressed; const SecondaryButton({super.key, required this.label, this.onPressed}); @override Widget build(BuildContext context) => SizedBox(width: double.infinity, height: 50, child: OutlinedButton(onPressed:onPressed, style: OutlinedButton.styleFrom(foregroundColor:AppColors.primaryText, side:const BorderSide(color:AppColors.border), shape:RoundedRectangleBorder(borderRadius:BorderRadius.circular(12))), child:Text(label))); }
