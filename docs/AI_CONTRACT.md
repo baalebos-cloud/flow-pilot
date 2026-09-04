@@ -1,46 +1,50 @@
+# Backend ↔ AI contract v1.0
 
-# FlowPilot AI Contract
+The authoritative Pydantic models live in `backend/app/ai/contracts.py`. Member 3 must import those models directly and must not maintain a second copy.
 
-## Purpose
+## Boundary
 
-The AI module is a recommendation engine only.
+```text
+Backend builds sanitized request
+→ RecommendationEngine.recommend(request)
+→ typed outcome
+→ backend reference and policy validation
+→ user-facing recommendation or clarification
+```
 
-The security boundary is:
+The AI module cannot access BMONI credentials, financial execution clients, private keys, PINs, raw KYC documents, or the database.
 
-AI interprets user intent
-→ deterministic backend validates policy
-→ user approves
-→ BMONI executes and signs
+## Outcomes
 
-The AI must never execute financial actions, access private keys, handle PINs,
-or bypass backend approval and policy controls.
+- `RECOMMENDATION`: typed candidate requiring backend validation.
+- `CLARIFICATION_REQUIRED`: one bounded question for missing context.
+- `UNSUPPORTED`: request is outside the allowed product surface.
+- `MODEL_ERROR`: fail-closed timeout, invalid output, provider outage, or internal failure.
 
-## Request flow
+## Security rules
 
-The backend creates a sanitized `RecommendationRequest`.
+- All models reject unknown fields.
+- All references must be selected from the backend request.
+- Market and opportunity facts must be backend-supplied evidence.
+- Money is represented as integer minor units.
+- Percentages/confidence use integer basis points.
+- The backend derives approval from action type; the AI value is never authoritative.
+- Protected pockets cannot fund Currency Shield.
+- Model metadata and prompt version accompany auditable outcomes.
 
-The request contains:
-
-- user message
-- base currency
-- available pockets
-- saved recipients
-- market observations
-- verified investment opportunities
-- allowed recommendation types
-
-The AI must use only the references supplied by the backend.
-
-## Engine interface
-
-Member 3 implements:
+## Member 3 implementation
 
 ```python
 from app.ai.contracts import RecommendationOutcome, RecommendationRequest
 
+
 class Member3Engine:
     async def recommend(
-        self,
-        request: RecommendationRequest,
+        self, request: RecommendationRequest
     ) -> RecommendationOutcome:
+        # Call the selected provider and validate its structured output.
         ...
+```
+
+The engine receives a maximum of eight seconds through `RecommendationService` by default. It returns only a typed outcome and performs no financial action.
+

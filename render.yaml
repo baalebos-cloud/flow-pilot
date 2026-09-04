@@ -1,0 +1,41 @@
+databases:
+  - name: flowpilot-db
+    databaseName: flowpilot
+    user: flowpilot
+    postgresMajorVersion: '17' # matches postgres:17.10-alpine in compose.yaml
+    plan: free # swap to a paid plan before this needs to outlive the hackathon
+
+services:
+  - type: web
+    name: flowpilot-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000 # matches EXPOSE 8000 / docker-entrypoint.sh --port 8000
+
+      - key: FLOWPILOT_ENV
+        value: production
+
+      - key: FLOWPILOT_SECRET
+        generateValue: true # Render generates a random 256-bit secret on first deploy
+
+      - key: DATABASE_URL
+        fromDatabase:
+          name: flowpilot-db
+          property: connectionString
+
+      - key: BMONI_MODE
+        value: mock # flip to "live" once BMONI's real base URL/schemas are confirmed
+
+      - key: BMONI_BASE_URL
+        value: '' # required once BMONI_MODE=live
+
+      - key: BMONI_API_KEY
+        sync: false # prompted at Blueprint creation time; never hardcode this
+
+      - key: BMONI_WEBHOOK_SECRET
+        sync: false # prompted at Blueprint creation time; required once FLOWPILOT_ENV != development

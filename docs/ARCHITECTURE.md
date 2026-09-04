@@ -18,6 +18,8 @@ Flutter app ── FlowPilot JWT ──> FastAPI
 4. State changes require authenticated ownership checks and idempotency.
 5. The Flutter signing SDK owns private-key operations.
 
+The in-process AI boundary is defined by `backend/app/ai/contracts.py` and documented in `docs/AI_CONTRACT.md`. The AI implementation imports this contract directly; it does not receive a BMONI client or database connection.
+
 ## Currency Shield state flow
 
 ```text
@@ -35,6 +37,10 @@ The current mock combines quote and execution for speed. Live integration must p
 - FlowPilot: app users, pockets, categorizations, recommendation evidence, consent, normalized transaction state.
 - BMONI: embedded financial identity, wallets, KYC, balances, quotes, conversions, transfers, authoritative settlement status.
 - Device: private key and signing PIN.
+
+## Persistence migration
+
+SQLAlchemy 2 models and Alembic migrations define the schema, while repositories isolate route code from persistence. Local tests may use SQLite through the same ORM; Docker Compose runs PostgreSQL and applies migrations before API startup.
 
 ## Failure rules
 

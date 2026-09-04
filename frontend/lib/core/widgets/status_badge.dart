@@ -1,0 +1,3 @@
+import 'package:flutter/material.dart';
+import '../../app/theme/app_colors.dart';
+class StatusBadge extends StatelessWidget { final String status; const StatusBadge({super.key,required this.status}); Color get c { final s=status.toLowerCase(); if(s.contains('confirm')||s.contains('approved')||s.contains('signed')) return AppColors.success; if(s.contains('fail')||s.contains('error')) return AppColors.error; return AppColors.accent; } @override Widget build(BuildContext context)=>Container(padding:const EdgeInsets.symmetric(horizontal:9,vertical:5),decoration:BoxDecoration(color:c.withOpacity(.12),borderRadius:BorderRadius.circular(20),border: Border.all(color: c.withOpacity(.25))),child:Text(status,style:TextStyle(fontSize:11,fontWeight:FontWeight.w600,color:c))); }

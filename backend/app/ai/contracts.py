@@ -1,39 +1,17 @@
-﻿from datetime import datetime
+from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel
 
 
-ReferenceId = Annotated[
-    str,
-    Field(
-        min_length=3,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9_-]+$",
-    ),
-]
-
-CurrencyCode = Annotated[
-    str,
-    Field(
-        min_length=3,
-        max_length=10,
-        pattern=r"^[A-Z0-9]+$",
-    ),
-]
-
-BasisPoints = Annotated[
-    int,
-    Field(ge=-100_000, le=100_000),
-]
+ReferenceId = Annotated[str, Field(min_length=3, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
+CurrencyCode = Annotated[str, Field(min_length=3, max_length=10, pattern=r"^[A-Z0-9]+$")]
+BasisPoints = Annotated[int, Field(ge=-100_000, le=100_000)]
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-        str_strip_whitespace=True,
-    )
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
 class RecommendationType(StrEnum):
@@ -133,34 +111,17 @@ class RecipientContext(StrictModel):
 
 class RecommendationContext(StrictModel):
     base_currency: CurrencyCode
-    pockets: list[PocketContext] = Field(
-        default_factory=list,
-        max_length=50,
-    )
-    market_observations: list[MarketObservation] = Field(
-        default_factory=list,
-        max_length=20,
-    )
-    investment_opportunities: list[InvestmentOpportunity] = Field(
-        default_factory=list,
-        max_length=20,
-    )
-    recipients: list[RecipientContext] = Field(
-        default_factory=list,
-        max_length=20,
-    )
-    allowed_recommendation_types: set[RecommendationType] = Field(
-        min_length=1
-    )
+    pockets: list[PocketContext] = Field(default_factory=list, max_length=50)
+    market_observations: list[MarketObservation] = Field(default_factory=list, max_length=20)
+    investment_opportunities: list[InvestmentOpportunity] = Field(default_factory=list, max_length=20)
+    recipients: list[RecipientContext] = Field(default_factory=list, max_length=20)
+    allowed_recommendation_types: set[RecommendationType] = Field(min_length=1)
 
 
 class RecommendationRequest(StrictModel):
     schema_version: Literal["1.0"] = "1.0"
     request_id: ReferenceId
-    user_message: str = Field(
-        min_length=1,
-        max_length=1_000,
-    )
+    user_message: str = Field(min_length=1, max_length=1_000)
     context: RecommendationContext
 
 
@@ -180,10 +141,7 @@ class BankWithdrawalParameters(StrictModel):
 
 class PocketCreationParameters(StrictModel):
     kind: Literal[RecommendationType.POCKET_CREATION]
-    suggested_name: str = Field(
-        min_length=2,
-        max_length=60,
-    )
+    suggested_name: str = Field(min_length=2, max_length=60)
     purpose: PocketPurpose
     amount_minor: int = Field(ge=0)
     currency: CurrencyCode
@@ -209,14 +167,8 @@ class CurrencyProtectionParameters(StrictModel):
 
 class SpendingAnalysisParameters(StrictModel):
     kind: Literal[RecommendationType.SPENDING_ANALYSIS]
-    pocket_reference_ids: list[ReferenceId] = Field(
-        default_factory=list,
-        max_length=50,
-    )
-    window_days: int = Field(
-        ge=1,
-        le=365,
-    )
+    pocket_reference_ids: list[ReferenceId] = Field(default_factory=list, max_length=50)
+    window_days: int = Field(ge=1, le=365)
 
 
 class InvestmentDiscoveryParameters(StrictModel):
@@ -240,18 +192,9 @@ RecommendationParameters = Annotated[
 
 
 class ModelMetadata(StrictModel):
-    provider: str = Field(
-        min_length=1,
-        max_length=80,
-    )
-    model: str = Field(
-        min_length=1,
-        max_length=120,
-    )
-    prompt_version: str = Field(
-        min_length=1,
-        max_length=40,
-    )
+    provider: str = Field(min_length=1, max_length=80)
+    model: str = Field(min_length=1, max_length=120)
+    prompt_version: str = Field(min_length=1, max_length=40)
 
 
 class RecommendationResult(StrictModel):
@@ -260,22 +203,10 @@ class RecommendationResult(StrictModel):
     request_id: ReferenceId
     recommendation_type: RecommendationType
     parameters: RecommendationParameters
-    reason_codes: list[ReasonCode] = Field(
-        min_length=1,
-        max_length=10,
-    )
-    evidence_reference_ids: list[ReferenceId] = Field(
-        default_factory=list,
-        max_length=20,
-    )
-    confidence_bps: int = Field(
-        ge=0,
-        le=10_000,
-    )
-    explanation: str = Field(
-        min_length=1,
-        max_length=800,
-    )
+    reason_codes: list[ReasonCode] = Field(min_length=1, max_length=10)
+    evidence_reference_ids: list[ReferenceId] = Field(default_factory=list, max_length=20)
+    confidence_bps: int = Field(ge=0, le=10_000)
+    explanation: str = Field(min_length=1, max_length=800)
     requires_user_approval: bool
     model_metadata: ModelMetadata
 
@@ -285,10 +216,7 @@ class ClarificationRequired(StrictModel):
     schema_version: Literal["1.0"] = "1.0"
     request_id: ReferenceId
     reason_code: ClarificationReasonCode
-    question: str = Field(
-        min_length=1,
-        max_length=300,
-    )
+    question: str = Field(min_length=1, max_length=300)
     model_metadata: ModelMetadata
 
 
@@ -296,10 +224,7 @@ class UnsupportedRequest(StrictModel):
     outcome: Literal["UNSUPPORTED"]
     schema_version: Literal["1.0"] = "1.0"
     request_id: ReferenceId
-    reason: str = Field(
-        min_length=1,
-        max_length=300,
-    )
+    reason: str = Field(min_length=1, max_length=300)
     model_metadata: ModelMetadata
 
 
@@ -307,23 +232,16 @@ class ModelFailure(StrictModel):
     outcome: Literal["MODEL_ERROR"]
     schema_version: Literal["1.0"] = "1.0"
     request_id: ReferenceId
-    error_code: Literal[
-        "TIMEOUT",
-        "INVALID_OUTPUT",
-        "PROVIDER_UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ]
+    error_code: Literal["TIMEOUT", "INVALID_OUTPUT", "PROVIDER_UNAVAILABLE", "INTERNAL_ERROR"]
     retryable: bool
 
 
 OutcomeValue = Annotated[
-    RecommendationResult
-    | ClarificationRequired
-    | UnsupportedRequest
-    | ModelFailure,
+    RecommendationResult | ClarificationRequired | UnsupportedRequest | ModelFailure,
     Field(discriminator="outcome"),
 ]
 
 
 class RecommendationOutcome(RootModel[OutcomeValue]):
     pass
+

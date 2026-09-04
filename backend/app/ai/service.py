@@ -1,41 +1,49 @@
 import asyncio
 
-from .contracts import RecommendationOutcome, RecommendationRequest
-from .engine import Member3Engine
+from pydantic import ValidationError
+
+from app.ai.contracts import ModelFailure, RecommendationOutcome, RecommendationRequest, RecommendationResult
+from app.ai.interface import RecommendationEngine
+from app.ai.policy import ContractPolicyError, ValidatedRecommendation, validate_recommendation
 
 
 class RecommendationService:
-    """
-    Backend-facing service for Member 3 AI recommendations.
-
-    The service:
-    - accepts a sanitized RecommendationRequest
-    - invokes Member3Engine
-    - enforces an 8-second timeout
-
-    It never executes financial actions.
-    """
-
-    def __init__(
-        self,
-        engine: Member3Engine | None = None,
-        timeout_seconds: float = 8.0,
-    ):
-        self.engine = engine or Member3Engine()
-        self.timeout_seconds = timeout_seconds
+    def __init__(self, engine: RecommendationEngine, timeout_seconds: float = 8.0):
+        self._engine = engine
+        self._timeout_seconds = timeout_seconds
 
     async def recommend(
-        self,
-        request: RecommendationRequest,
-    ) -> RecommendationOutcome:
+        self, request: RecommendationRequest
+    ) -> ValidatedRecommendation | RecommendationOutcome:
         try:
-            return await asyncio.wait_for(
-                self.engine.recommend(request),
-                timeout=self.timeout_seconds,
+            raw_outcome = await asyncio.wait_for(
+                self._engine.recommend(request), timeout=self._timeout_seconds
             )
-        except asyncio.TimeoutError:
-            return self.engine._model_error(
-                request,
-                error_code="TIMEOUT",
-                retryable=True,
-            )
+        except TimeoutError:
+            return _failure(request.request_id, "TIMEOUT", retryable=True)
+        except Exception:
+            return _failure(request.request_id, "INTERNAL_ERROR", retryable=True)
+
+        try:
+            outcome = RecommendationOutcome.model_validate(raw_outcome)
+        except ValidationError:
+            return _failure(request.request_id, "INVALID_OUTPUT", retryable=False)
+
+        value = outcome.root
+        if not isinstance(value, RecommendationResult):
+            return outcome
+        try:
+            return validate_recommendation(request, value)
+        except ContractPolicyError:
+            return _failure(request.request_id, "INVALID_OUTPUT", retryable=False)
+
+
+def _failure(request_id: str, error_code: str, *, retryable: bool) -> RecommendationOutcome:
+    return RecommendationOutcome(
+        ModelFailure(
+            outcome="MODEL_ERROR",
+            request_id=request_id,
+            error_code=error_code,
+            retryable=retryable,
+        )
+    )

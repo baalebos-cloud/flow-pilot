@@ -17,6 +17,7 @@ Demo-ready FastAPI backend for smart pockets, Currency Shield, and FlowPilot's c
 
 - Users register and log in with FlowPilot; they never enter a BMONI user ID.
 - On first registration, the backend provisions a BMONI embedded user and stores the mapping.
+- Sandbox registration requires an E.164 `phone_number`, sends the partner key as `x-api-key`, and recovers a prior successful create after a `409` instead of creating blindly.
 - The Flutter app embeds BMONI's SDK. Wallet PIN checks and private-key signing happen on-device.
 - The backend receives a public wallet address and transaction signatures, never the PIN/private key.
 - `BMONI_MODE=mock` provides a full demo path until the real BMONI request schemas are confirmed.
@@ -34,6 +35,14 @@ uvicorn app.main:app --reload
 
 Open `http://127.0.0.1:8000/docs` for the interactive API.
 
+Database migrations are managed with Alembic:
+
+```powershell
+alembic upgrade head
+```
+
+All runtime persistence uses SQLAlchemy. Local Python runs default to SQLite; Docker Compose uses PostgreSQL and applies Alembic migrations before starting the API.
+
 ## Docker (recommended)
 
 From the repository root:
@@ -49,7 +58,9 @@ Stop the service without deleting the database volume:
 docker compose down
 ```
 
-The container runs as UID/GID `10001`, drops Linux capabilities, uses a read-only root filesystem, and writes SQLite data only to the named `/data` volume. Do not use the development secret in a shared or deployed environment.
+The backend container runs as UID/GID `10001`, drops Linux capabilities, and uses a read-only root filesystem. PostgreSQL owns the persistent named volume. Do not use either development password in a shared or deployed environment.
+
+Confirmed vendor behavior and the current sandbox boundary are documented in [BMONI integration](../docs/BMONI_INTEGRATION.md).
 
 ## Demo flow
 
