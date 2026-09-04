@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.bmoni import BmoniError, bmoni
+from app.balances import fetch_wallet_balances
 from app.config import settings
 from app.database import session_scope
 from app.models import ActionPlan, FxConversion, Pocket, Recommendation, Transaction, User, Wallet, WebhookEvent
@@ -279,6 +280,14 @@ def create_managed_wallet(
         "currency": currency,
         "status": status,
     }
+
+
+@app.get("/v1/wallets/balances")
+def wallet_balances(user: User = Depends(current_user)) -> dict:
+    if not user.bmoni_user_id:
+        raise HTTPException(status_code=409, detail="BMONI user provisioning is incomplete")
+    balances = fetch_wallet_balances(bmoni, bmoni_user_id=user.bmoni_user_id)
+    return {"balances": [balance.model_dump() for balance in balances]}
 
 
 @app.post("/v1/action-plans", status_code=201)
