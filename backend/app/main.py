@@ -7,12 +7,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import JSONResponse
 from jwt import InvalidTokenError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.ai.router import build_ai_router
-from .auth import get_current_user
 from app.bmoni import BmoniError, bmoni
 from app.balances import (
     available_balance_minor,
@@ -74,7 +74,6 @@ from app.security import (
 from app.workflow import (
     ACTION_PLAN_TRANSITIONS,
     RECOMMENDATION_TRANSITIONS,
-    TRANSACTION_TRANSITIONS,
     ActionPlanStatus,
     RecommendationStatus,
     TransactionStatus,
@@ -126,9 +125,6 @@ app = FastAPI(
 )
 
 
-app.include_router(build_ai_router(get_current_user))
-
-
 security = HTTPBearer()
 
 
@@ -137,18 +133,11 @@ def current_user(
 ) -> User:
     """Resolve the authenticated active FlowPilot user."""
     try:
-        payload = decode_access_token(credentials.credentials)
+        user_id = decode_access_token(credentials.credentials)
     except InvalidTokenError:
         raise HTTPException(
             status_code=401,
             detail="Invalid or expired access token",
-        )
-
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid access token",
         )
 
     with session_scope() as session:
@@ -170,17 +159,17 @@ def current_user(
         return user
 
 
+app.include_router(build_ai_router(current_user))
+
+
 @app.exception_handler(BmoniError)
 async def handle_bmoni_error(request: Request, exc: BmoniError):
     """Normalize BMONI failures into the API error format."""
     status_code = 503 if exc.retryable else 502
 
-    return HTTPException(
+    return JSONResponse(
         status_code=status_code,
-        detail={
-            "code": exc.code,
-            "message": str(exc),
-        },
+        content={"detail": str(exc), "code": exc.code, "retryable": exc.retryable},
     )
 
 
@@ -332,6 +321,12 @@ def link_wallet(
     """Link a user's external wallet."""
     currency = payload.currency.upper()
 
+    remote = bmoni.link_wallet(
+        bmoni_user_id=user.bmoni_user_id or "",
+        address=payload.wallet_address,
+        currency=currency,
+    )
+
     with session_scope() as session:
         existing = get_wallet_by_user(session, user.id)
 
@@ -344,9 +339,10 @@ def link_wallet(
         wallet = Wallet(
             id=new_id("wal"),
             user_id=user.id,
+            bmoni_wallet_id=remote["id"],
             wallet_address=payload.wallet_address,
             currency=currency,
-            status="LINKED",
+            status=remote["status"],
             created_at=utc_now(),
         )
 
@@ -639,17 +635,12 @@ def approve_action_plan(
 
         remote = bmoni.create_withdrawal_proposal(
             bmoni_user_id=snapshot[3],
-            smart_wallet_id=snapshot[4],
-            amount_decimal=minor_to_decimal(
-                snapshot[0],
-                "NGN",
-            ),
+            amount_minor=snapshot[0],
             currency=snapshot[1],
             recipient_name=snapshot[2],
-            idempotency_key=idempotency_key,
         )
 
-        proposal_id = remote["data"]["proposal"]["id"]
+        proposal_id = remote["id"]
 
     except Exception:
         with session_scope() as session:
@@ -689,7 +680,7 @@ def approve_action_plan(
 
         plan.approval_status = transition(
             plan.approval_status,
-            ActionPlanStatus.AWAITING_USER_SIGNATURE,
+            ActionPlanStatus.APPROVED,
             ACTION_PLAN_TRANSITIONS,
         )
 
@@ -786,10 +777,11 @@ def transaction_signing_payload(
             detail="BMONI user provisioning is incomplete",
         )
 
-    return bmoni.get_proposal_signing_payload(
+    result = bmoni.get_proposal_signing_payload(
         bmoni_user_id=user.bmoni_user_id,
         proposal_id=item.bmoni_proposal_id,
     )
+    return result["data"]
 
 
 @app.post("/v1/transactions/{transaction_id}/signature")
@@ -1931,8 +1923,8 @@ async def bmoni_webhook(
         and x_webhook_id != event_id
     ):
         raise HTTPException(
-            status_code=400,
-            detail="Webhook id does not match event payload",
+            status_code=422,
+            detail="Webhook ID header does not match body",
         )
 
     event_type = payload.get(
@@ -1964,7 +1956,8 @@ async def bmoni_webhook(
 
         if existing:
             return {
-                "status": "already_processed"
+                "received": True,
+                "duplicate": True,
             }
 
         session.add(
@@ -2018,8 +2011,8 @@ async def bmoni_webhook(
             event.processed = True
 
     return {
-        "status": "processed",
-        "event_id": event_id,
+        "received": True,
+        "duplicate": False,
     }
 
 

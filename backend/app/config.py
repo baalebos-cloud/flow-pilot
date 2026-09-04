@@ -27,7 +27,9 @@ class Settings:
 
     environment: str = os.getenv("FLOWPILOT_ENV", "development")
 
-    secret: str = os.getenv("FLOWPILOT_SECRET", "dev-only-change-me")
+    secret: str = os.getenv(
+        "FLOWPILOT_SECRET", "dev-only-change-me-at-least-32-bytes"
+    )
 
     database_url: str = os.getenv(
         "DATABASE_URL", "sqlite+pysqlite:///flowpilot.db"

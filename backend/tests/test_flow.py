@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app import config
+from app.bmoni import bmoni
 from app.database import get_engine, reset_engine_for_tests, session_scope
 from app.main import app, validate_pocket_allocation
 from app.models import Base, Pocket, User
@@ -23,6 +24,7 @@ def isolated_db(tmp_path: Path, monkeypatch):
         "database_url",
         f"sqlite+pysqlite:///{tmp_path / 'test.db'}",
     )
+    monkeypatch.setattr(bmoni, "mode", "mock")
 
     # Clear any previously cached engine before creating the test database.
     reset_engine_for_tests()
@@ -125,7 +127,7 @@ def test_complete_demo_flow(
             },
         )
 
-        assert approval.status_code == 201
+        assert approval.status_code == 201, approval.text
 
         transaction_id = approval.json()["id"]
 
@@ -136,14 +138,14 @@ def test_complete_demo_flow(
         )
 
         assert signing.status_code == 200
-        assert len(signing.json()["hash"]) == 66
+        assert len(signing.json()["hashToSign"]) == 66
 
         # Submit the transaction signature.
         submitted = client.post(
             f"/v1/transactions/{transaction_id}/signature",
             headers=headers,
             json={
-                "signature": "0xdeadbeef1234567890",
+                "signature": "0x" + "a" * 130,
             },
         )
 

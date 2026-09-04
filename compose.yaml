@@ -27,7 +27,7 @@ services:
       - "127.0.0.1:${FLOWPILOT_PORT:-8000}:8000"
     environment:
       FLOWPILOT_ENV: ${FLOWPILOT_ENV:-development}
-      FLOWPILOT_SECRET: ${FLOWPILOT_SECRET:-dev-only-change-before-deploy}
+      FLOWPILOT_SECRET: ${FLOWPILOT_SECRET:-dev-only-change-before-deploy-32-bytes}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-flowpilot}:${POSTGRES_PASSWORD:-local-postgres-password}@postgres:5432/${POSTGRES_DB:-flowpilot}
       BMONI_MODE: ${BMONI_MODE:-mock}
       BMONI_BASE_URL: ${BMONI_BASE_URL:-}
