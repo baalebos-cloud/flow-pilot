@@ -193,3 +193,76 @@ def test_managed_wallet_returns_existing_currency_without_duplicate(monkeypatch)
 
     assert result == existing
     assert calls == ["GET"]
+
+
+def test_sandbox_quote_uses_exact_input_decimal_contract(monkeypatch):
+    monkeypatch.setattr(config.settings, "bmoni_base_url", "https://embedded-dev.bmoni.com")
+    monkeypatch.setattr(config.settings, "bmoni_api_key", "test-key")
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return response(
+            200,
+            {
+                "quoteId": "quote-1",
+                "fromCurrency": "NGN",
+                "toCurrency": "USD",
+                "amountIn": "1000.00",
+                "amountOut": "0.62",
+                "exchangeRate": "0.00062",
+                "toUsdExchangeRate": "0.00062",
+                "fees": [],
+                "quotedAt": "2026-09-04T00:00:00.000Z",
+                "expiresAt": "2026-09-04T00:00:20.000Z",
+                "expiresInSeconds": 20,
+            },
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    result = BmoniGateway(mode="sandbox").get_fx_quote(
+        bmoni_user_id="user-1",
+        amount_decimal="1000.00",
+        source="NGN",
+        target="USD",
+    )
+
+    assert result["quoteId"] == "quote-1"
+    assert captured["url"].endswith("/v1/users/user-1/exchange/quote")
+    assert captured["json"] == {
+        "swapAmount": {"type": "exactIn", "amountIn": "1000.00"},
+        "fromCurrency": "NGN",
+        "toCurrency": "USD",
+    }
+
+
+def test_proposal_approval_uses_verified_sandbox_route(monkeypatch):
+    monkeypatch.setattr(config.settings, "bmoni_base_url", "https://embedded-dev.bmoni.com")
+    monkeypatch.setattr(config.settings, "bmoni_api_key", "test-key")
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return response(
+            200,
+            {
+                "data": {
+                    "proposal": {
+                        "id": "proposal-1",
+                        "status": "PENDING_SIGNATURES",
+                    }
+                }
+            },
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    result = BmoniGateway(mode="sandbox").approve_proposal(
+        bmoni_user_id="user-1", proposal_id="proposal-1"
+    )
+
+    assert result["data"]["proposal"]["status"] == "PENDING_SIGNATURES"
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith(
+        "/v1/users/user-1/smart-wallets/proposals/proposal-1/approve"
+    )
+    assert captured["json"] is None

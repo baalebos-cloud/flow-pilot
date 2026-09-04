@@ -47,6 +47,21 @@ An upstream per-currency read failure is represented as unavailable, not as a
 zero balance. Internal allocation policies can call `available_balance_minor`
 and fail closed when the authoritative balance cannot be read.
 
+## Currency Shield quote
+
+`POST /v1/fx/quotes` checks the requested CNGN amount against the authoritative
+BMONI balance before requesting an `exactIn` NGN-to-USD quote. The response
+includes the quote ID, rate, output, fees, and expiry and explicitly states
+that no money has moved. Quote retrieval never authorizes execution.
+
+The proposal approval route is omitted from the current sandbox OpenAPI
+document but is active at
+`POST /v1/users/{userId}/smart-wallets/proposals/{proposalId}/approve`.
+On 4 September 2026, a request using a deliberately nonexistent proposal ID
+reached the handler and returned BMONI `E501` / `Proposal not found`. FlowPilot
+now treats the guide and verified runtime behavior as authoritative for this
+route. Successful execution still requires a funded wallet and a real proposal.
+
 ## Intentionally blocked outside mock mode
 
 - A bank withdrawal uses the Nigerian beneficiary/offramp sequence.

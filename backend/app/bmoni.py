@@ -3,6 +3,7 @@
 import hashlib
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -285,18 +286,37 @@ class BmoniGateway:
             raise ValueError("Signature must be a non-empty hexadecimal value")
         return {"id": proposal_id, "status": "COMPLETED"}
 
-    def get_fx_quote(self, *, amount_minor: int, source: str, target: str) -> dict:
+    def get_fx_quote(
+        self,
+        *,
+        bmoni_user_id: str,
+        amount_decimal: str,
+        source: str,
+        target: str,
+    ) -> dict:
         if self.mode != "mock":
-            self._live_unconfigured("get_fx_quote")
+            return self._request(
+                "POST",
+                f"/v1/users/{bmoni_user_id}/exchange/quote",
+                json_body={
+                    "swapAmount": {"type": "exactIn", "amountIn": amount_decimal},
+                    "fromCurrency": source,
+                    "toCurrency": target,
+                },
+            )
+        amount_out = Decimal(amount_decimal) / Decimal(1600)
         return {
-            "id": f"bm_qte_{uuid.uuid4().hex[:16]}",
-            "source": source,
-            "target": target,
-            "source_amount_minor": amount_minor,
-            "target_amount_minor": amount_minor // 1600,
-            "rate": "1600.00",
-            "fee_minor": 0,
-            "expires_in_seconds": 60,
+            "quoteId": f"bm_qte_{uuid.uuid4().hex[:16]}",
+            "fromCurrency": source,
+            "toCurrency": target,
+            "amountIn": amount_decimal,
+            "amountOut": f"{amount_out:.2f}",
+            "exchangeRate": "0.000625",
+            "toUsdExchangeRate": "0.000625",
+            "fees": [],
+            "quotedAt": "2099-01-01T00:00:00.000Z",
+            "expiresAt": "2099-01-01T00:01:00.000Z",
+            "expiresInSeconds": 60,
         }
 
     def execute_fx_conversion(self, *, quote_id: str, idempotency_key: str) -> dict:
@@ -307,6 +327,31 @@ class BmoniGateway:
             "status": "COMPLETED",
             "quote_id": quote_id,
         }
+
+    def approve_proposal(self, *, bmoni_user_id: str, proposal_id: str) -> dict:
+        if self.mode == "mock":
+            return {
+                "data": {
+                    "proposal": {
+                        "id": proposal_id,
+                        "status": "PENDING_SIGNATURES",
+                    }
+                }
+            }
+        result = self._request(
+            "POST",
+            f"/v1/users/{bmoni_user_id}/smart-wallets/proposals/{proposal_id}/approve",
+        )
+        try:
+            proposal = result["data"]["proposal"]
+            if not proposal.get("id") or not proposal.get("status"):
+                raise KeyError
+        except (KeyError, TypeError) as exc:
+            raise BmoniError(
+                "BMONI proposal approval response is invalid",
+                code="BMONI_INVALID_RESPONSE",
+            ) from exc
+        return result
 
 
 bmoni = BmoniGateway()

@@ -51,6 +51,14 @@ def decimal_to_minor(value: str, currency: str) -> int:
     return int((amount * scale).to_integral_value(rounding=ROUND_DOWN))
 
 
+def minor_to_decimal(value: int, currency: str) -> str:
+    places = MINOR_UNITS.get(currency)
+    if places is None or value <= 0:
+        raise ValueError("Amount and currency cannot be converted to minor units")
+    amount = Decimal(value) / (Decimal(10) ** places)
+    return f"{amount:.{places}f}"
+
+
 def fetch_wallet_balances(
     gateway: BmoniGateway, *, bmoni_user_id: str
 ) -> list[WalletBalance]:

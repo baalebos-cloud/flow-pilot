@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.bmoni import BmoniError, bmoni
-from app.balances import fetch_wallet_balances
+from app.balances import available_balance_minor, fetch_wallet_balances, minor_to_decimal
 from app.config import settings
 from app.database import session_scope
 from app.models import ActionPlan, FxConversion, Pocket, Recommendation, Transaction, User, Wallet, WebhookEvent
@@ -23,7 +23,8 @@ from app.repositories import (
 )
 from app.rate_limit import enforce_rate_limit
 from app.schemas import (
-    ActionPlanRequest, CurrencyShieldRequest, LoginRequest, PocketCreateRequest,
+    ActionPlanRequest, CurrencyShieldRequest, FxQuoteRequest, LoginRequest,
+    PocketCreateRequest,
     ManagedWalletCreateRequest, OwnerProofChallengeRequest, RegisterRequest,
     SignatureRequest, WalletLinkRequest,
 )
@@ -288,6 +289,57 @@ def wallet_balances(user: User = Depends(current_user)) -> dict:
         raise HTTPException(status_code=409, detail="BMONI user provisioning is incomplete")
     balances = fetch_wallet_balances(bmoni, bmoni_user_id=user.bmoni_user_id)
     return {"balances": [balance.model_dump() for balance in balances]}
+
+
+@app.post("/v1/fx/quotes")
+def create_fx_quote(
+    payload: FxQuoteRequest, user: User = Depends(current_user)
+) -> dict:
+    if not user.bmoni_user_id:
+        raise HTTPException(status_code=409, detail="BMONI user provisioning is incomplete")
+    source = payload.source_currency.upper()
+    target = payload.target_currency.upper()
+    if (source, target) != ("CNGN", "USD"):
+        raise HTTPException(status_code=422, detail="The MVP supports CNGN to USD only")
+    balance_minor = available_balance_minor(
+        bmoni, bmoni_user_id=user.bmoni_user_id, currency=source
+    )
+    if payload.amount_minor > balance_minor:
+        raise HTTPException(status_code=422, detail="Insufficient authoritative balance")
+    quote = bmoni.get_fx_quote(
+        bmoni_user_id=user.bmoni_user_id,
+        amount_decimal=minor_to_decimal(payload.amount_minor, "NGN"),
+        source="NGN",
+        target=target,
+    )
+    required = {
+        "quoteId",
+        "fromCurrency",
+        "toCurrency",
+        "amountIn",
+        "amountOut",
+        "exchangeRate",
+        "fees",
+        "quotedAt",
+        "expiresAt",
+        "expiresInSeconds",
+    }
+    if not isinstance(quote, dict) or not required.issubset(quote):
+        raise BmoniError("BMONI quote response is invalid", code="BMONI_INVALID_RESPONSE")
+    return {
+        "quote_id": quote["quoteId"],
+        "source_currency": source,
+        "target_currency": target,
+        "source_amount_minor": payload.amount_minor,
+        "target_amount": quote["amountOut"],
+        "exchange_rate": quote["exchangeRate"],
+        "fees": quote["fees"],
+        "quoted_at": quote["quotedAt"],
+        "expires_at": quote["expiresAt"],
+        "expires_in_seconds": quote["expiresInSeconds"],
+        "money_has_moved": False,
+        "requires_user_approval": True,
+    }
 
 
 @app.post("/v1/action-plans", status_code=201)
@@ -591,10 +643,13 @@ def approve_currency_shield(recommendation_id: str,
         raise HTTPException(status_code=409, detail="Recommendation is incomplete")
     try:
         quote = bmoni.get_fx_quote(
-            amount_minor=snapshot[0], source=snapshot[1], target=snapshot[2]
+            bmoni_user_id=user.bmoni_user_id or "",
+            amount_decimal=minor_to_decimal(snapshot[0], "NGN"),
+            source="NGN",
+            target=snapshot[2],
         )
         remote = bmoni.execute_fx_conversion(
-            quote_id=quote["id"], idempotency_key=idempotency_key
+            quote_id=quote["quoteId"], idempotency_key=idempotency_key
         )
     except Exception:
         with session_scope() as session:

@@ -55,3 +55,9 @@ class CurrencyShieldRequest(BaseModel):
     amount_minor: int = Field(gt=0)
     observed_change_bps: int
     observation_window_days: int = Field(ge=1, le=365)
+
+
+class FxQuoteRequest(BaseModel):
+    amount_minor: int = Field(gt=0)
+    source_currency: str = "CNGN"
+    target_currency: str = "USD"

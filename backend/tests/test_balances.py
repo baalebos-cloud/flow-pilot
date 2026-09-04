@@ -1,6 +1,11 @@
 import pytest
 
-from app.balances import available_balance_minor, decimal_to_minor, fetch_wallet_balances
+from app.balances import (
+    available_balance_minor,
+    decimal_to_minor,
+    fetch_wallet_balances,
+    minor_to_decimal,
+)
 from app.bmoni import BmoniError
 
 
@@ -16,6 +21,7 @@ class BalanceGateway:
 def test_decimal_balance_is_converted_without_float_rounding():
     assert decimal_to_minor("123.450000", "NGN") == 12_345
     assert decimal_to_minor("0.019999", "USD") == 1
+    assert minor_to_decimal(100_000, "NGN") == "1000.00"
 
 
 def test_balance_response_is_normalized_to_minor_units():

@@ -16,6 +16,7 @@ Interactive documentation is available at `/docs` while the service runs.
 | POST | `/v1/wallets/owner-proof-challenges` | Request BMONI EIP-191 ownership message |
 | POST | `/v1/wallets/managed` | Submit device signature and create/recover managed wallet |
 | GET | `/v1/wallets/balances` | Read authoritative BMONI balances normalized to minor units |
+| POST | `/v1/fx/quotes` | Obtain an expiring CNGN-to-USD quote without moving money |
 | POST/GET | `/v1/pockets` | Create/list virtual pockets |
 | POST | `/v1/recommendations/currency-shield` | Deterministic eligibility and explanation |
 | POST | `/v1/recommendations/{id}/approve` | Quote and execute approved mock conversion |
