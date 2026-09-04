@@ -469,28 +469,12 @@ def owned_transaction(transaction_id: str, user_id: str) -> Transaction:
 def read_transaction(transaction_id: str, user: User = Depends(current_user)) -> dict:
     return model_dict(owned_transaction(transaction_id, user.id))
 
-@app.get(
-    "/v1/transactions/{transaction_id}/signing-payload"
-)
-def signing_payload(
-    transaction_id: str,
-    user: dict = Depends(current_user),
-) -> dict:
-    transaction = owned_transaction(
-        transaction_id,
-        user["id"],
-    )
-
 @app.get("/v1/transactions/{transaction_id}/signing-payload")
 def signing_payload(transaction_id: str, user: User = Depends(current_user)) -> dict:
     item = owned_transaction(transaction_id, user.id)
     if item.status != "PENDING_SIGNATURE":
         raise HTTPException(status_code=409, detail="Transaction is not awaiting a signature")
     return bmoni.get_signing_payload(proposal_id=item.bmoni_proposal_id)
-
-    return bmoni.get_signing_payload(
-        proposal_id=transaction["bmoni_proposal_id"]
-    )
 
 @app.post("/v1/transactions/{transaction_id}/signature")
 def submit_signature(transaction_id: str, payload: SignatureRequest,
